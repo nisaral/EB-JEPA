@@ -38,3 +38,11 @@ where = ["veyra/python/src"]
 [tool.setuptools.package-data]
 "soro" = ["dashboard.html"]
 "soro.v1" = ["*.pyi"]
+
+[tool.pytest.ini_options]
+testpaths = ["veyra/python/tests", "veyra/tests", "tests"]
+addopts = "-p no:cacheprovider"
+markers = [
+  "network: needs internet access (Hugging Face Hub downloads)",
+  "slow: loads real model weights",
+]
