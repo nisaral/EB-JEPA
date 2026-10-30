@@ -22,10 +22,36 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
+# HTTP server: `soro-boro serve`
+server = [
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+]
+# gRPC / protobuf transport used by soro.framework
+grpc = [
+  "protobuf>=4.25",
+  "grpcio>=1.60",
+]
+# Gradio demo app
+demo = [
+  "gradio>=4.0",
+]
+test = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
-  "gradio>=4.0",
+  "hypothesis>=6.100",
+  "protobuf>=4.25",
+  "grpcio>=1.60",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+]
+dev = [
+  "soro-boro[test]",
+  "pre-commit>=3.5",
+  "ruff>=0.5",
+]
+all = [
+  "soro-boro[server,grpc,demo,test]",
 ]
 
 [project.scripts]
