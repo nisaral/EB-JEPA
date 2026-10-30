@@ -361,4 +361,3 @@ If you use Soro-Kev or Universal Tool Harness in your research or production sys
   year = {2025}
 }
 ```
-

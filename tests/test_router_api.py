@@ -6,7 +6,6 @@ import warnings
 from types import SimpleNamespace
 
 import pytest
-
 from soro_boro import Action, Router, RouterLoadError, RoutingDecision, ToolSpec, normalize_tools
 from soro_boro.tool_schema import ToolSchemaError, normalize_tool
 
@@ -237,7 +236,6 @@ def test_server(router):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-
     from soro_boro.server import create_app
 
     c = TestClient(create_app(router))

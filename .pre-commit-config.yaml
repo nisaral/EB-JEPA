@@ -1,0 +1,20 @@
+# pip install pre-commit && pre-commit install   (or: make lint)
+# Ruff is scoped to the maintained public surface (Router API, CLI, server, examples, new tests/scripts).
+# Widen `files:` as older modules are cleaned up.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--select, "E9,F,I", --line-length, "130", --fix]
+        files: ^(veyra/python/src/soro_boro/(router|server|cli|tool_schema)\.py|examples/.*\.py|tests/test_(examples|readme_snippets|router_api)\.py|scripts/(recalibrate_qhat|per_query_ci|ci_smoke)\.py)$
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: end-of-file-fixer
+        files: ^(docs/.*\.md|examples/.*|CHANGELOG\.md|CONTRIBUTING\.md)$
