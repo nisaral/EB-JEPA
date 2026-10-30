@@ -1,7 +1,8 @@
 """System-One Soro-Kev Decision Model Training Loop.
 
-Trains dual linear pointer projection heads + LoRA adapter on Qwen/Qwen2.5-0.5B (or Qwen3-0.6B)
-with a weighted multi-task objective: route CE, Brier scoring, permutation consistency, and
+Trains dual linear pointer projection heads + LoRA adapter on a causal backbone chosen with
+--base-model (default Qwen/Qwen3-0.6B). The released checkpoints use Qwen/Qwen3.5-0.8B-Base
+(soro-kev-0.8b) and Qwen/Qwen3-4B (soro-kev-4b), per their adapter_config.json. Training uses a weighted multi-task objective: route CE, Brier scoring, permutation consistency, and
 auxiliary decision heads, followed by periodic split-conformal validation.
 """
 
