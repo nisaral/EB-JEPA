@@ -27,6 +27,12 @@ __all__ = [
     "WriteAheadLog",
     "WALRecord",
     "SoroHarness",
+    "Router",
+    "RoutingDecision",
+    "Action",
+    "ToolSpec",
+    "normalize_tools",
+    "RouterLoadError",
 ]
 
 
@@ -34,4 +40,12 @@ def __getattr__(name: str):
     if name == "SoroHarness":
         from soro.harness.pipeline import SoroHarness
         return SoroHarness
+    if name in ("Router", "RoutingDecision", "Action", "RouterLoadError", "Scorer"):
+        from soro_boro import router
+
+        return getattr(router, name)
+    if name in ("ToolSpec", "normalize_tools", "normalize_tool"):
+        from soro_boro import tool_schema
+
+        return getattr(tool_schema, name)
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

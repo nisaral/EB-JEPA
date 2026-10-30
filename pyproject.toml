@@ -57,6 +57,7 @@ all = [
 [project.scripts]
 soro = "soro.cli:main"
 soro-audit = "soro.cli_audit:main"
+soro-boro = "soro_boro.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["veyra/python/src"]

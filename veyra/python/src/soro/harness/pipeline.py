@@ -587,6 +587,15 @@ class SoroHarness:
     ) -> RouteResult:
         """2-stage Conformal Router returning calibrated prediction set S and action."""
         if candidates is not None:
+            import warnings
+
+            warnings.warn(
+                "SoroHarness.route(candidates=...) permanently registers mock tools on the harness and is "
+                "deprecated; use soro_boro.Router().route(query, tools=[...]) for stateless routing, or "
+                "register real tools with @harness.tool.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             if isinstance(candidates, list):
                 for cand in candidates:
                     if isinstance(cand, dict):
