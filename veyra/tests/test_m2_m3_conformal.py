@@ -32,7 +32,7 @@ def test_conformal_quantile_finite_order_statistic():
 
 
 def test_m2_m3_benchmark_artifacts_validity():
-    p = Path("reports/results_m2_m3_conformal_pasc.json")
+    p = Path(__file__).resolve().parents[1] / "reports" / "results_m2_m3_conformal_pasc.json"
     assert p.exists()
     d = json.loads(p.read_text(encoding="utf-8"))
     assert d["n_splits"] == 1000

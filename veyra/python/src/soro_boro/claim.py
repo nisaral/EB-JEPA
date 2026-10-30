@@ -34,7 +34,7 @@ class SQLiteClaimStore:
     """Cross-process, thread-safe atomic claim store backed by SQLite."""
 
     def __init__(self, db_path: str | Path | None = None):
-        self.db_path = str(db_path or "runs/soro_boro_claims.db")
+        self.db_path = str(db_path or os.environ.get("SORO_BORO_CLAIMS_DB") or "runs/soro_boro_claims.db")
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self._lock = threading.Lock()
         self._init_db()

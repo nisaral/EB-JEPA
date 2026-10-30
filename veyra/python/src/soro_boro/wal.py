@@ -40,7 +40,7 @@ class WriteAheadLog:
     """Thread-safe append-only Write-Ahead Log with hash chaining and crash recovery."""
 
     def __init__(self, log_path: str | Path | None = None):
-        self.log_path = Path(log_path or "runs/soro_boro_wal.jsonl")
+        self.log_path = Path(log_path or os.environ.get("SORO_BORO_WAL") or "runs/soro_boro_wal.jsonl")
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._last_hash = self._init_last_hash()

@@ -55,7 +55,7 @@ def test_m4_http_suite_metrics():
 
 
 def test_m4_report_artifact_validity():
-    p = Path("reports/results_m4_real_faults.json")
+    p = Path(__file__).resolve().parents[1] / "reports" / "results_m4_real_faults.json"
     assert p.exists()
     data = json.loads(p.read_text(encoding="utf-8"))
     assert len(data["systems"]) == 4

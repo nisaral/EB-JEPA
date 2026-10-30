@@ -15,6 +15,8 @@ import os
 import sys
 from pathlib import Path
 
+_GOLDEN_DIR = Path(__file__).resolve().parents[2] / "standalone" / "soro-audit"
+
 import pytest
 
 from soro.cli_audit import (
@@ -124,7 +126,7 @@ def test_golden_filesystem_raw_wire_capture():
     3. Critical tools like read_file have readOnlyHint: True.
     4. Overwrite tools like write_file have idempotentHint: True, destructiveHint: True.
     """
-    raw_path = Path(__file__).resolve().parent.parent / "raw_tools_list_filesystem.json"
+    raw_path = _GOLDEN_DIR / "raw_tools_list_filesystem.json"
     assert raw_path.exists(), f"Golden artifact missing: {raw_path}"
 
     import json
@@ -153,7 +155,7 @@ def test_golden_memory_raw_wire_capture():
     2. All 9 tools declare explicit annotations.
     3. Query tools like read_graph have readOnlyHint: True.
     """
-    raw_path = Path(__file__).resolve().parent.parent / "raw_tools_list_memory.json"
+    raw_path = _GOLDEN_DIR / "raw_tools_list_memory.json"
     assert raw_path.exists(), f"Golden artifact missing: {raw_path}"
 
     import json
@@ -176,7 +178,7 @@ def test_golden_everything_raw_wire_capture():
     2. All 13 tools declare explicit annotations in tool['annotations'].
     3. Handshake handles notifications/tools/list_changed message prior to id: 2 response.
     """
-    raw_path = Path(__file__).resolve().parent.parent / "raw_tools_list_everything.json"
+    raw_path = _GOLDEN_DIR / "raw_tools_list_everything.json"
     assert raw_path.exists(), f"Golden artifact missing: {raw_path}"
 
     import json
