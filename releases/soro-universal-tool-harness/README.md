@@ -35,6 +35,13 @@ Unlike standard function-calling datasets that train models to emit token-by-tok
 | **`val_zeroshot.jsonl`** | 2,220 | 11,100 | 55 held-out pkgs | Strictly disjoint tool schemas and packages never seen during training (0 package overlap with train). Contains 52 collision distractors. |
 | **`val_external_heldout.jsonl`** | 1,200 | 6,000 | 5 held-out pkgs | 115 unique base queries evaluated across ~10 format/distractor views: 1,095 reference MCP server tool rows + 105 $\tau^2$ multi-turn customer persona rows. |
 
+> **Known issue: no independent human split.** The repo also contains `val_external_human.jsonl`. It is byte-identical to
+> `val_external_heldout.jsonl` and is **not** a separate set of human-written queries. Treat it as a duplicate.
+>
+> **Licenses:** the `license: apache-2.0` tag covers the packaging. Upstream rows keep their own licenses
+> (τ²-bench MIT, MCP Semantic Tool Routing Benchmark CC BY 4.0, others unverified). See
+> [DATA_LICENSES.md](https://github.com/nisaral/Soro-Boro/blob/main/DATA_LICENSES.md).
+
 ---
 
 ## Supported Schema Formats

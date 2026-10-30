@@ -252,13 +252,26 @@ To verify train/test integrity, we executed and committed a complete 3-tier mach
 
 ---
 
-## Known Limitations (read before citing these numbers)
+## Limitations (read before citing these numbers)
 
-- **BFCL scope:** the BFCL table above is a 100-row diagnostic (34 multiple, 33 live-multiple, 33 irrelevance rows from BFCL v3). It is not a full BFCL run or a leaderboard submission.
-- **Abstention regression (0.8B):** on the 33 BFCL irrelevance rows, Soro-Kev-0.8B abstains correctly on 17/33, versus 27/33 for its starting checkpoint `jaredpalmer/kev-0.8b`. Fine-tuning improved routing but made irrelevance refusal worse at this size. Soro-Kev-4B gets 25/33.
-- **Conformal threshold:** `SoroHarness.route()` reads `q_hat` from the checkpoint and applies the LAC set rule (see `veyra/python/src/soro/harness/pipeline.py`). The 0.8B `calibrated_q_hat` was computed on a small calibration slice, so coverage is not guaranteed on other distributions. TODO(Keyush): state which accuracy tables above were scored with the conformal gate and which with plain top-1 argmax.
-- **Human split:** `val_external_human.jsonl` on the Hugging Face dataset is byte-identical to `val_external_heldout.jsonl`, so there is no independent human-written split yet. See `veyra/data/soro_kev_dataset/DATA_NOTES.md`.
-- **Head weights format:** `head.pt` is a pickle. New checkpoints also write `head.safetensors`, which the loader prefers. For an existing checkpoint, run `python -c "from soro.routing.kev_model import convert_head_pt_to_safetensors as c; c('path/to/ckpt')"`.
+- **115 distinct queries behind 1,200 rows.** The external held-out set is 115 distinct base queries, each shown in about 10 format and distractor views. Rows within a query are correlated, so row-level CIs are too narrow. Cluster-bootstrap 95% CIs over the 115 queries (`python scripts/per_query_ci.py`, 10,000 resamples):
+
+  | System | Row accuracy | Wilson 95% (rows, too narrow) | Cluster bootstrap 95% (queries) |
+  | :--- | :---: | :---: | :---: |
+  | Soro-Kev-4B | 90.58% (1087/1200) | 88.8–92.1% | **85.9–94.7%** |
+  | Soro-Kev-0.8B | 85.67% (1028/1200) | 83.6–87.5% | **80.3–90.6%** |
+  | Option logits (base) | 58.92% (707/1200) | 56.1–61.7% | 52.1–65.5% |
+  | BM25 | 58.67% (704/1200) | 55.9–61.4% | 51.7–65.4% |
+  | Cross-encoder | 56.75% (681/1200) | 53.9–59.5% | 49.6–63.8% |
+  | Dense cosine | 49.58% (595/1200) | 46.8–52.4% | 42.5–56.6% |
+
+- **τ² is weak.** On the 105 τ²-bench rows (telecom and retail), accuracy is **10.5% (11/105)** for 0.8B and **24.8% (26/105)** for 4B. The headline numbers come almost entirely from the 1,095 MCP-benchmark rows (92.9% / 96.9%). Do not expect τ²-style customer-service routing to work well yet.
+- **No-tool refusal regressed at 0.8B.** On the 33 BFCL irrelevance rows, Soro-Kev-0.8B abstains correctly on **17/33**, versus **27/33** for its starting checkpoint `jaredpalmer/kev-0.8b`. Fine-tuning improved routing but made refusal worse at this size. Soro-Kev-4B gets 25/33. If false tool calls are costly, use 4B or raise `q_hat`.
+- **BFCL scope.** The BFCL table is a 100-row diagnostic (34 multiple, 33 live-multiple, 33 irrelevance, from BFCL v3). It is not a full BFCL run or a leaderboard submission.
+- **Conformal threshold.** `Router.route()` and `SoroHarness.route()` apply the LAC set rule with the checkpoint's `q_hat`. That value was fitted on a 100-row slice of `val_zeroshot`, so coverage is **not guaranteed** on your traffic. On the external set, the fitted q̂ would be 0.9813 (0.8B) and 0.845 (4B). Recalibrate on your own logs. TODO(Keyush): state which accuracy tables were scored with the conformal gate and which with plain top-1 argmax.
+- **No independent human split.** On the HF dataset, `val_external_human.jsonl` is byte-identical to `val_external_heldout.jsonl`. Read any "human" result as a held-out result. See `veyra/data/soro_kev_dataset/DATA_NOTES.md`.
+- **Data licenses.** The data is not all Apache-2.0. See [DATA_LICENSES.md](DATA_LICENSES.md).
+- **Head weights format.** `head.pt` is a pickle. It is loaded with `torch.load(weights_only=True)`. New checkpoints also write `head.safetensors`, which the loader prefers. Convert an old checkpoint with `soro-boro convert-head path/to/ckpt`.
 
 ---
 
