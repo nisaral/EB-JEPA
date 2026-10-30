@@ -84,7 +84,16 @@ base queries, not over the 1,200 rows.
 - **LangChain / LlamaIndex:** pass their tool objects unchanged: [`examples/framework_adapters.py`](examples/framework_adapters.py)
 
 Docs: [quickstart](docs/quickstart.md) · [concepts](docs/concepts.md) · [API](docs/API.md) · [FAQ](docs/FAQ.md) ·
-[contributing](CONTRIBUTING.md) · [good first issues](docs/GOOD_FIRST_ISSUES.md)
+[contributing](CONTRIBUTING.md) · [good first issues](https://github.com/nisaral/Soro-Boro/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+
+## Contributing / Help wanted
+
+Soro-Boro is a one-person project and help is very welcome. There are 10 small, offline, CPU-only starter tasks,
+each with acceptance criteria:
+[good first issues](https://github.com/nisaral/Soro-Boro/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) ·
+[help wanted](https://github.com/nisaral/Soro-Boro/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22).
+Comment on an issue to claim it, read [CONTRIBUTING.md](CONTRIBUTING.md), and use
+[Discussions](https://github.com/nisaral/Soro-Boro/discussions) for questions, ideas and failure cases you found.
 
 ---
 

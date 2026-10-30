@@ -1,7 +1,7 @@
 # Good first issues
 
 These are ready-to-file starter tasks. Each one is small, testable offline, and points at the code involved.
-(Maintainer: copy them into GitHub issues with the `good first issue` label when you are ready.)
+They are filed as GitHub issues #2–#11 with the `good first issue` and `help wanted` labels: [open list](https://github.com/nisaral/Soro-Boro/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 
 1. **`veyra/tests` collects cleanly on its own.** Running `pytest veyra/tests` alone gives 3 collection
    errors (`veyra.core` missing); the full root run is fine. Make those modules skip cleanly or fix the
