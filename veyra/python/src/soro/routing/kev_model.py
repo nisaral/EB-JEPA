@@ -750,6 +750,51 @@ class SoroKevModel(nn.Module):
         }
 
 
+def _flatten_head_weights(head_weights: dict[str, Any]) -> dict[str, torch.Tensor]:
+    flat: dict[str, torch.Tensor] = {}
+    for name, value in head_weights.items():
+        if isinstance(value, torch.Tensor):
+            flat[name] = value.detach().contiguous().cpu()
+        else:
+            for key, tensor in value.items():
+                flat[f"{name}.{key}"] = tensor.detach().contiguous().cpu()
+    return flat
+
+
+def _unflatten_head_weights(flat: dict[str, torch.Tensor]) -> dict[str, Any]:
+    nested: dict[str, Any] = {}
+    for key, tensor in flat.items():
+        if "." in key:
+            name, sub = key.split(".", 1)
+            nested.setdefault(name, {})[sub] = tensor
+        else:
+            nested[key] = tensor
+    return nested
+
+
+def save_head_safetensors(head_weights: dict[str, Any], path: Path | str) -> None:
+    """Write pointer-head weights (nested state dicts) as a flat safetensors file."""
+    from safetensors.torch import save_file
+
+    save_file(_flatten_head_weights(head_weights), str(path))
+
+
+def load_head_safetensors(path: Path | str, device: str = "cpu") -> dict[str, Any]:
+    """Read a head.safetensors file back into the nested layout used by head.pt."""
+    from safetensors.torch import load_file
+
+    return _unflatten_head_weights(load_file(str(path), device=device))
+
+
+def convert_head_pt_to_safetensors(checkpoint_dir: Path | str) -> Path:
+    """Convert an existing checkpoint's head.pt to head.safetensors (head.pt is kept)."""
+    path = Path(checkpoint_dir)
+    weights = torch.load(path / "head.pt", map_location="cpu")
+    out = path / "head.safetensors"
+    save_head_safetensors(weights, out)
+    return out
+
+
 def save_soro_kev_checkpoint(
     model: SoroKevModel,
     out_dir: Path,
@@ -766,6 +811,11 @@ def save_soro_kev_checkpoint(
         "log_temp": model.log_temp.data,
     }
     torch.save(head_weights, out_dir / "head.pt")
+    # Also write a pickle-free copy. Loading prefers head.safetensors when present.
+    try:
+        save_head_safetensors(head_weights, out_dir / "head.safetensors")
+    except ImportError:
+        pass
 
     # If real PEFT LoRA backbone is present, save adapter
     if hasattr(model.backbone, "save_pretrained") and not isinstance(model.backbone, MockCausalBackbone):
@@ -794,11 +844,12 @@ def load_soro_kev_checkpoint(checkpoint_dir: Path | str, device: str = "cpu") ->
     """Load SoroKevModel directly from checkpoint directory without external kev package."""
     path = Path(checkpoint_dir)
     head_file = path / "head.pt"
+    head_st_file = path / "head.safetensors"
     config_file = path / "config.json"
     temp_file = path / "temperature.json"
 
-    if not head_file.exists():
-        raise FileNotFoundError(f"Missing head.pt in {path}")
+    if not head_file.exists() and not head_st_file.exists():
+        raise FileNotFoundError(f"Missing head.pt / head.safetensors in {path}")
 
     cfg: dict[str, Any] = {}
     if config_file.exists():
@@ -819,7 +870,10 @@ def load_soro_kev_checkpoint(checkpoint_dir: Path | str, device: str = "cpu") ->
 
         set_peft_model_state_dict(model.backbone, load_file(str(adapter)))
 
-    weights = torch.load(head_file, map_location=device)
+    if head_st_file.exists():
+        weights = load_head_safetensors(head_st_file, device=device)
+    else:
+        weights = torch.load(head_file, map_location=device)
     model.q_proj_head.load_state_dict(weights["q_proj_head"])
     model.opt_proj_head.load_state_dict(weights["opt_proj_head"])
     if "binary_head" in weights:
