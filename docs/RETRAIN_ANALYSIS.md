@@ -77,8 +77,7 @@ gap to base `kev-0.8b` (27/33) needs **data**, not gate tuning.
 ### What it would address
 
 1. **No-tool refusal at 0.8B.** Train on more and harder no-tool rows (BFCL-irrelevance-style chit-chat,
-   near-miss requests, "explain how X works" next to tool X). Currently `__abstain__` is gold on roughly
-   the share counted in `train.jsonl`. Target 15–20% abstain gold, with hard negatives drawn from the
+   near-miss requests, "explain how X works" next to tool X). The current abstain share in train has not been measured here. Target 15–20% abstain gold, with hard negatives drawn from the
    same catalog.
 2. **τ² domain.** Convert more τ² telecom and retail turns: multi-turn state, persona context, tools
    whose names collide with generic MCP tools. τ² train rows today are airline only (1,436). Telecom
