@@ -1,4 +1,10 @@
-# Soro-Kev: Calibration-Aware System-One Tool Router (4B & 0.8B)
+# Soro-Boro: calibrated tool routing for AI agents
+
+**Pick the right tool in a single forward pass, or ask, or refuse, and know which one you'll get.**
+Soro-Boro routes a user request to one of your tools (OpenAI, MCP, Anthropic, LangChain, LlamaIndex, plain
+functions) with the open-weights **Soro-Kev** pointer models (0.8B / 4B). It cannot invent a tool name and returns
+a calibrated `EXECUTE` / `ASK` / `ABSTAIN` decision.
+
 
 [![PyPI Version](https://img.shields.io/pypi/v/soro-boro.svg?color=blue)](https://pypi.org/project/soro-boro/)
 [![GitHub Release](https://img.shields.io/github/v/release/nisaral/Soro-Boro?color=blue&label=Release)](https://github.com/nisaral/Soro-Boro/releases)
@@ -8,9 +14,82 @@
 [![Dataset](https://img.shields.io/badge/Dataset-Universal%20Tool%20Harness-yellow)](https://huggingface.co/datasets/nisaralll/soro-universal-tool-harness)
 [![License](https://img.shields.io/badge/License-Apache%202.0-black.svg)](LICENSE)
 
+<p align="center"><img src="docs/hero.png" alt="Soro-Boro routing a query to EXECUTE / ASK / ABSTAIN" width="820"></p>
+
+## 30-second quickstart
+
 ```bash
-pip install soro-boro
+pip install soro-boro            # add [server] for the HTTP server
 ```
+
+```python
+from soro_boro import Router
+
+tools = [
+    {"name": "get_weather", "description": "Get the current weather for a city",
+     "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+    {"name": "send_email", "description": "Send an email to a recipient",
+     "inputSchema": {"type": "object", "properties": {"to": {"type": "string"}, "body": {"type": "string"}}}},
+]
+
+router = Router.heuristic()                                   # no download: lexical demo scorer
+# router = Router.from_pretrained("nisaralll/soro-kev-0.8b")  # real model (runs on CPU)
+
+d = router.route("what's the weather in Paris?", tools)
+print(d.action, d.tool, round(d.confidence, 2))   # EXECUTE get_weather 1.0
+print(d.repair_args({"City": "Paris"}))           # {'city': 'Paris'}
+```
+
+The same flow from the shell:
+
+```bash
+soro-boro doctor                                   # environment check
+soro-boro route "what's the weather in Paris?" --tools tools.json --heuristic
+soro-boro serve --model nisaralll/soro-kev-0.8b    # POST /route, POST /v1/route (OpenAI messages)
+```
+
+`Router.heuristic()` is a keyword-overlap baseline that only exists so you can try the API without
+downloading weights. Use `from_pretrained` for real routing.
+
+## What you get
+
+| | |
+| :--- | :--- |
+| **Closed-set output** | The model scores only your tools plus `__abstain__`, so it cannot invent a tool name. |
+| **Calibrated decisions** | Split-conformal set S = {p ≥ 1 − q̂}. One tool means `EXECUTE`, several mean `ASK`, none or abstain means `ABSTAIN`. Set `q_hat=` to trade refusals against calls. |
+| **Any tool format** | OpenAI (chat and flat), MCP `inputSchema`, Anthropic `input_schema`, LangChain, LlamaIndex, `{name: desc}`, Python callables. |
+| **Argument repair** | `decision.repair_args()` fixes key case and aliases and fills defaults against the chosen schema. |
+| **Prefill only** | Measured 124 ms (0.8B) and 649 ms (4B) per pass on an RTX 4050 Laptop. No decode loop. |
+| **Batteries** | CLI (`route`, `eval`, `serve`, `doctor`), FastAPI server, [examples](examples/). |
+
+## Honest results
+
+These come from the committed prediction logs (`benchmarks/`). The CIs are cluster-bootstrapped over the 115 distinct
+base queries, not over the 1,200 rows.
+
+| | Soro-Kev-4B | Soro-Kev-0.8B |
+| :--- | :---: | :---: |
+| External held-out top-1 (1,200 rows) | **90.6%** (95% CI 85.9–94.7) | **85.7%** (80.3–90.6) |
+| BFCL irrelevance: refuses a no-tool query (/33) | 25 | 17 (base kev-0.8b gets 27; `q_hat=0.1` gets 23) |
+| τ²-bench rows (105) | 24.8% | 10.5% |
+| Latency per pass, RTX 4050 Laptop | 649 ms | 124 ms |
+
+τ² (multi-turn customer service) is a weak spot. See [Limitations](#limitations-read-before-citing-these-numbers) and
+[docs/RETRAIN_ANALYSIS.md](docs/RETRAIN_ANALYSIS.md).
+
+## Use it with…
+
+- **OpenAI function calling:** pre-route and force `tool_choice`, so you send one schema instead of fifty: [`examples/openai_prerouter.py`](examples/openai_prerouter.py)
+- **MCP:** route across many servers' `tools/list` and build the `tools/call`: [`examples/mcp_gateway.py`](examples/mcp_gateway.py)
+- **LangChain / LlamaIndex:** pass their tool objects unchanged: [`examples/framework_adapters.py`](examples/framework_adapters.py)
+
+Docs: [quickstart](docs/quickstart.md) · [concepts](docs/concepts.md) · [API](docs/API.md) · [FAQ](docs/FAQ.md) ·
+[contributing](CONTRIBUTING.md) · [good first issues](docs/GOOD_FIRST_ISSUES.md)
+
+---
+
+## How it works (technical details)
+
 
 **Soro-Kev** is an open-weights decision model family (4B flagship & 0.8B edge) designed as a **Single-Prefill Causal Listwise Tool Reranker & Multi-Task Pointer Classifier with an Explicit `__abstain__` Slot** (1 forward pass for menus $\le 16$ tools; 2-stage tournament chunking for larger menus). It provides AI agent tool routing, schema normalization, and execution boundary control.
 
@@ -66,9 +145,9 @@ User State + Tool Catalog
 
 ---
 
-## Quickstart & Installation
+## Installation & the execution harness
 
-Install directly from PyPI into your environment:
+Install from PyPI:
 
 ```bash
 pip install soro-boro
@@ -82,7 +161,10 @@ cd Soro-Boro
 pip install -e .
 ```
 
-### 5-Line Python SDK
+### Execution harness (`SoroHarness`)
+
+`Router` (above) only decides. `SoroHarness` also registers Python tools, executes them with boundary
+checks, and guards against duplicate mutations. The snippet below needs a GPU with bitsandbytes for NF4.
 
 ```python
 from soro.harness.pipeline import SoroHarness
