@@ -27,3 +27,6 @@ not in the repo. None of them changes the code.
    rate measured separately from the 0.8B model's?
 10. **Release mechanics.** Tag `v0.2.1`, publish to PyPI, update the HF cards from `docs/hf_cards/`,
     and upload the social preview. All four are pending the maintainer's decision.
+11. **External q̂ mismatch.** Refitting LAC q̂ (α = 0.10, s = 1 − p_true) on `benchmarks/predictions/external_heldout`
+    gives 0.9546 (0.8B) and 0.4825 (4B). `config.json` lists `external_human_q_hat` = 0.9813 and 0.845. Was a
+    different score, row subset or α used?
