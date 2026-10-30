@@ -1,0 +1,42 @@
+{
+  "model": "nisaralll/soro-kev-0.8b",
+  "device": "cpu",
+  "q_hat": 0.9518,
+  "decisions": [
+    {
+      "q": "What's the weather in Paris right now?",
+      "action": "EXECUTE",
+      "tool": "get_weather",
+      "conf": 1.0,
+      "cands": [
+        "get_weather"
+      ]
+    },
+    {
+      "q": "Book something with Sam next Tuesday at 3pm",
+      "action": "EXECUTE",
+      "tool": "create_calendar_event",
+      "conf": 1.0,
+      "cands": [
+        "create_calendar_event"
+      ]
+    },
+    {
+      "q": "Write me a haiku about autumn",
+      "action": "ABSTAIN",
+      "tool": null,
+      "conf": 0.998,
+      "cands": []
+    },
+    {
+      "q": "Email Sam the flight options",
+      "action": "ASK",
+      "tool": "send_email",
+      "conf": 0.79,
+      "cands": [
+        "send_email",
+        "search_flights"
+      ]
+    }
+  ]
+}
