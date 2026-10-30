@@ -252,6 +252,16 @@ To verify train/test integrity, we executed and committed a complete 3-tier mach
 
 ---
 
+## Known Limitations (read before citing these numbers)
+
+- **BFCL scope:** the BFCL table above is a 100-row diagnostic (34 multiple, 33 live-multiple, 33 irrelevance rows from BFCL v3). It is not a full BFCL run or a leaderboard submission.
+- **Abstention regression (0.8B):** on the 33 BFCL irrelevance rows, Soro-Kev-0.8B abstains correctly on 17/33, versus 27/33 for its starting checkpoint `jaredpalmer/kev-0.8b`. Fine-tuning improved routing but made irrelevance refusal worse at this size. Soro-Kev-4B gets 25/33.
+- **Conformal threshold:** `SoroHarness.route()` reads `q_hat` from the checkpoint and applies the LAC set rule (see `veyra/python/src/soro/harness/pipeline.py`). The 0.8B `calibrated_q_hat` was computed on a small calibration slice, so coverage is not guaranteed on other distributions. TODO(Keyush): state which accuracy tables above were scored with the conformal gate and which with plain top-1 argmax.
+- **Human split:** `val_external_human.jsonl` on the Hugging Face dataset is byte-identical to `val_external_heldout.jsonl`, so there is no independent human-written split yet. See `veyra/data/soro_kev_dataset/DATA_NOTES.md`.
+- **Head weights format:** `head.pt` is a pickle. New checkpoints also write `head.safetensors`, which the loader prefers. For an existing checkpoint, run `python -c "from soro.routing.kev_model import convert_head_pt_to_safetensors as c; c('path/to/ckpt')"`.
+
+---
+
 ## Architectural Trade-Offs & v0.3 Roadmap
 
 ### 1. Left-to-Right Causal Attention Asymmetry
