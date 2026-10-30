@@ -6,8 +6,11 @@
 > with mathematical consistency checks enforced via `reconcile_and_verify.py`.
 >
 > **Calibration Note**: “Conformal Coverage” columns are measured by the calibration/evaluation
-> pipeline. The current `SoroHarness.route()` production gate uses a top-mass rule and does not
-> apply the fitted `q_hat`; these columns are not a production coverage guarantee.
+> pipeline. Since v0.2.1, `SoroHarness.route()` and `soro_boro.Router.route()` apply the split-conformal
+> LAC gate S = {p ≥ 1 − q̂} with the checkpoint's `q_hat` (0.9518 for 0.8B, 0.8066 for 4B). That `q_hat`
+> was fitted on a 100-row seed-42 slice of `val_zeroshot`, so these columns are still not a coverage
+> guarantee on other distributions; on the external held-out set the fitted q̂ would be higher
+> (0.9813 / 0.845, see the model cards). Recalibrate on your own traffic for a real guarantee.
 
 ### Table 1: External Held-Out Generalization (1,200 rows across 115 unique base queries)
 
