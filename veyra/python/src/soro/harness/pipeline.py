@@ -128,6 +128,188 @@ def _semantic_param_similarity(input_key: str, target_param: str, target_type: A
     return score
 
 
+_JSON_TYPES: dict[str, Any] = {
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "string": str,
+    "object": dict,
+    "array": list,
+}
+
+
+def conformal_gate(probabilities: dict[str, float], q_hat: float) -> tuple[str, str | None, list[str], float, str]:
+    """Split-conformal LAC gate used by both ``SoroHarness.route`` and ``soro_boro.Router``.
+
+    Prediction set S = {i : p_i >= 1 - q_hat}. Returns
+    ``(action, selected_tool, set_without_abstain, threshold, reason)`` where action is
+    EXECUTE (exactly one tool in S), ASK (two or more), or ABSTAIN (no tool in S, or
+    ``__abstain__`` is the top-1 option).
+    """
+    threshold = 1.0 - float(q_hat)
+    ranked = sorted(probabilities.items(), key=lambda kv: kv[1], reverse=True)
+    if not ranked:
+        return "ABSTAIN", None, [], threshold, "No candidate probabilities available"
+    top_tool, top_prob = ranked[0]
+    S = [name for name, p in ranked if p >= threshold]
+    s_tools = [name for name in S if name != "__abstain__"]
+    if not s_tools or top_tool == "__abstain__":
+        return (
+            "ABSTAIN",
+            None,
+            [],
+            threshold,
+            f"Conformal abstention (top={top_tool}, p={top_prob:.3f}, |S|={len(S)}, q_hat={q_hat:.4f})",
+        )
+    if len(s_tools) == 1:
+        sel = s_tools[0]
+        return (
+            "EXECUTE",
+            sel,
+            s_tools,
+            threshold,
+            f"Singleton conformal set ({sel}, p={probabilities.get(sel, 0.0):.3f} >= {threshold:.4f})",
+        )
+    return (
+        "ASK",
+        s_tools[0],
+        s_tools,
+        threshold,
+        f"Ambiguous prediction set size {len(s_tools)} under q_hat={q_hat:.4f} (threshold={threshold:.4f})",
+    )
+
+
+def repair_arguments(
+    parameters: dict[str, dict[str, Any]],
+    arguments: dict[str, Any],
+    scorer: Any = None,
+    forward_extra: bool = False,
+) -> dict[str, Any]:
+    """Repair proposed arguments against a parameter table.
+
+    ``parameters`` maps a parameter name to ``{"type": <python type or JSON-schema
+    type name>, "default": <value or inspect.Parameter.empty>}``. Keys are matched
+    exactly, then camelCase->snake_case, then by token/synonym/hashed-dense
+    similarity (>= 0.40), then (if ``scorer`` has ``evaluate_turn``) by the
+    model's arg_mapping head. Values are then type-coerced.
+    """
+
+    repaired: dict[str, Any] = {}
+    raw = dict(arguments)
+
+    # 1. Direct and camelCase -> snake_case matching
+    raw_normalized: dict[str, Any] = {}
+    matched_keys: set[str] = set()
+
+    for k, v in raw.items():
+        raw_normalized[k] = v
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", k).lower()
+        if snake != k:
+            raw_normalized.setdefault(snake, v)
+
+    for p_name, p_info in parameters.items():
+        if p_name in raw_normalized:
+            repaired[p_name] = raw_normalized[p_name]
+            matched_keys.add(p_name)
+            # Also mark camelCase source key as matched
+            for raw_k in raw:
+                snake_k = re.sub(r"(?<!^)(?=[A-Z])", "_", raw_k).lower()
+                if snake_k == p_name or raw_k == p_name:
+                    matched_keys.add(raw_k)
+
+    # 2. Semantic Key Mapping for unrecognized arguments
+    unmatched_raw = {k: v for k, v in raw.items() if k not in matched_keys}
+    unpopulated_params = {p: info for p, info in parameters.items() if p not in repaired}
+
+    if unmatched_raw and unpopulated_params:
+        for raw_k, raw_v in list(unmatched_raw.items()):
+            best_param = None
+            best_sim = 0.0
+
+            for p_name, p_info in unpopulated_params.items():
+                sim = _semantic_param_similarity(raw_k, p_name, p_info.get("type"))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_param = p_name
+
+            # If confidence exceeds threshold, map the argument
+            if best_param and best_sim >= 0.40:
+                repaired[best_param] = raw_v
+                matched_keys.add(raw_k)
+                del unpopulated_params[best_param]
+            elif unpopulated_params and scorer is not None and hasattr(scorer, "evaluate_turn"):
+                criteria = {p: f"Schema parameter: {p}" for p in unpopulated_params}
+                criteria["__drop__"] = "This argument does not belong to the tool."
+                decision = scorer.evaluate_turn(
+                    f"User Request: {raw_k}={raw_v}",
+                    {"arg_mapping": {
+                        "type": "choice",
+                        "instructions": f"Which target parameter does the argument '{raw_k}' correspond to?",
+                        "criteria": criteria,
+                    }},
+                )
+                choice = (decision.get("answers") or {}).get("arg_mapping")
+                if choice in unpopulated_params:
+                    repaired[choice] = raw_v
+                    matched_keys.add(raw_k)
+                    del unpopulated_params[choice]
+
+    # 3. Type Coercion & Normalization on populated fields
+    for p_name, p_info in parameters.items():
+        target_type = _JSON_TYPES.get(p_info.get("type"), p_info.get("type")) if isinstance(p_info.get("type"), str) else p_info.get("type")
+        val = repaired.get(p_name)
+
+        if val is None:
+            if p_info.get("default", inspect.Parameter.empty) != inspect.Parameter.empty:
+                repaired[p_name] = p_info.get("default")
+            continue
+
+        try:
+            # Integer coercion
+            if target_type in (int, "int") and isinstance(val, (str, float)) and not isinstance(val, bool):
+                repaired[p_name] = int(float(val))
+            # Float coercion
+            elif target_type in (float, "float") and isinstance(val, (str, int)) and not isinstance(val, bool):
+                repaired[p_name] = float(val)
+            # Boolean coercion
+            elif target_type in (bool, "bool") and isinstance(val, (str, int)):
+                if isinstance(val, str):
+                    repaired[p_name] = val.strip().lower() in ("true", "1", "yes", "on")
+                elif isinstance(val, int):
+                    repaired[p_name] = bool(val)
+            # Serialized JSON string parsing
+            elif target_type in (dict, list) and isinstance(val, str):
+                try:
+                    repaired[p_name] = json.loads(val)
+                except Exception:
+                    repaired[p_name] = val
+            # ISO Date Normalization
+            elif target_type in (str, "str") and isinstance(val, str):
+                clean_val = val.strip()
+                # Check YYYY/MM/DD or ISO with T
+                if "/" in clean_val or "T" in clean_val:
+                    for fmt in ("%Y/%m/%d", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%dT%H:%M:%SZ"):
+                        try:
+                            dt = datetime.datetime.strptime(clean_val.split("T")[0] if "T" in clean_val else clean_val, fmt.split("T")[0])
+                            clean_val = dt.strftime("%Y-%m-%d")
+                            break
+                        except ValueError:
+                            pass
+                repaired[p_name] = clean_val
+            elif target_type in (str, "str") and not isinstance(val, str):
+                repaired[p_name] = str(val)
+        except (ValueError, TypeError):
+            repaired[p_name] = val
+
+    # Forward extra keys only if target function accepts **kwargs
+    if forward_extra:
+        for k, v in raw.items():
+            if k not in repaired:
+                repaired[k] = v
+
+    return repaired
+
+
 class SoroHarness:
     """Type-safe MCP & Agent Tool Harness chaining Conformal Route -> Semantic Repair -> Soro-Boro Guard."""
 
@@ -527,48 +709,16 @@ class SoroHarness:
             )
 
         # Form the prediction set strictly via Split Conformal LAC: S = { i | p_i >= 1 - q_hat }
-        lac_threshold = 1.0 - eff_q_hat
-        S = [name for name, p in sorted_by_prob if p >= lac_threshold]
-        s_tools = [name for name in S if name != "__abstain__"]
-
-        # Decision policy:
-        # 1. If S = empty or S = {"__abstain__"} (or "__abstain__" is top-1 and exceeds non-abstain tools): return ABSTAIN
-        if not s_tools or top_tool == "__abstain__":
-            return RouteResult(
-                action="ABSTAIN",
-                selected_tool=None,
-                candidates=[],
-                probabilities=probs,
-                scores=scores_map,
-                alpha=eff_alpha,
-                q_hat=eff_q_hat,
-                reason=f"Conformal abstention (top={top_tool}, p={top_prob:.3f}, |S|={len(S)}, q_hat={eff_q_hat:.4f})",
-            )
-
-        # 2. If |S \ {"__abstain__"}| == 1: return EXECUTE with that single tool
-        if len(s_tools) == 1:
-            selected = s_tools[0]
-            return RouteResult(
-                action="EXECUTE",
-                selected_tool=selected,
-                candidates=s_tools,
-                probabilities=probs,
-                scores=scores_map,
-                alpha=eff_alpha,
-                q_hat=eff_q_hat,
-                reason=f"Singleton conformal set ({selected}, p={probs.get(selected, 0.0):.3f} >= {lac_threshold:.4f})",
-            )
-
-        # 3. If |S \ {"__abstain__"}| >= 2: return ASK with all candidate tools in S \ {"__abstain__"}
+        action, selected, s_tools, _threshold, reason = conformal_gate(probs, eff_q_hat)
         return RouteResult(
-            action="ASK",
-            selected_tool=s_tools[0],
+            action=action,
+            selected_tool=selected,
             candidates=s_tools,
             probabilities=probs,
             scores=scores_map,
             alpha=eff_alpha,
             q_hat=eff_q_hat,
-            reason=f"Ambiguous prediction set size {len(s_tools)} under q_hat={eff_q_hat:.4f} (threshold={lac_threshold:.4f})",
+            reason=reason,
         )
 
     def _multi_tool_plan(self) -> list[str]:
@@ -1033,123 +1183,9 @@ class SoroHarness:
         entry = self._tools.get(tool_name)
         if not entry:
             return dict(arguments)
-
-        repaired: dict[str, Any] = {}
-        raw = dict(arguments)
-
-        # 1. Direct and camelCase -> snake_case matching
-        raw_normalized: dict[str, Any] = {}
-        matched_keys: set[str] = set()
-
-        for k, v in raw.items():
-            raw_normalized[k] = v
-            snake = re.sub(r"(?<!^)(?=[A-Z])", "_", k).lower()
-            if snake != k:
-                raw_normalized.setdefault(snake, v)
-
-        for p_name, p_info in entry.parameters.items():
-            if p_name in raw_normalized:
-                repaired[p_name] = raw_normalized[p_name]
-                matched_keys.add(p_name)
-                # Also mark camelCase source key as matched
-                for raw_k in raw:
-                    snake_k = re.sub(r"(?<!^)(?=[A-Z])", "_", raw_k).lower()
-                    if snake_k == p_name or raw_k == p_name:
-                        matched_keys.add(raw_k)
-
-        # 2. Semantic Key Mapping for unrecognized arguments
-        unmatched_raw = {k: v for k, v in raw.items() if k not in matched_keys}
-        unpopulated_params = {p: info for p, info in entry.parameters.items() if p not in repaired}
-
-        if unmatched_raw and unpopulated_params:
-            for raw_k, raw_v in list(unmatched_raw.items()):
-                best_param = None
-                best_sim = 0.0
-
-                for p_name, p_info in unpopulated_params.items():
-                    sim = _semantic_param_similarity(raw_k, p_name, p_info["type"])
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_param = p_name
-
-                # If confidence exceeds threshold, map the argument
-                if best_param and best_sim >= 0.40:
-                    repaired[best_param] = raw_v
-                    matched_keys.add(raw_k)
-                    del unpopulated_params[best_param]
-                elif unpopulated_params and hasattr(self._scorer, "evaluate_turn"):
-                    criteria = {p: f"Schema parameter: {p}" for p in unpopulated_params}
-                    criteria["__drop__"] = "This argument does not belong to the tool."
-                    decision = self._scorer.evaluate_turn(
-                        f"User Request: {raw_k}={raw_v}",
-                        {"arg_mapping": {
-                            "type": "choice",
-                            "instructions": f"Which target parameter does the argument '{raw_k}' correspond to?",
-                            "criteria": criteria,
-                        }},
-                    )
-                    choice = (decision.get("answers") or {}).get("arg_mapping")
-                    if choice in unpopulated_params:
-                        repaired[choice] = raw_v
-                        matched_keys.add(raw_k)
-                        del unpopulated_params[choice]
-
-        # 3. Type Coercion & Normalization on populated fields
-        for p_name, p_info in entry.parameters.items():
-            target_type = p_info["type"]
-            val = repaired.get(p_name)
-
-            if val is None:
-                if p_info["default"] != inspect.Parameter.empty:
-                    repaired[p_name] = p_info["default"]
-                continue
-
-            try:
-                # Integer coercion
-                if target_type in (int, "int") and isinstance(val, (str, float)) and not isinstance(val, bool):
-                    repaired[p_name] = int(float(val))
-                # Float coercion
-                elif target_type in (float, "float") and isinstance(val, (str, int)) and not isinstance(val, bool):
-                    repaired[p_name] = float(val)
-                # Boolean coercion
-                elif target_type in (bool, "bool") and isinstance(val, (str, int)):
-                    if isinstance(val, str):
-                        repaired[p_name] = val.strip().lower() in ("true", "1", "yes", "on")
-                    elif isinstance(val, int):
-                        repaired[p_name] = bool(val)
-                # Serialized JSON string parsing
-                elif target_type in (dict, list) and isinstance(val, str):
-                    try:
-                        repaired[p_name] = json.loads(val)
-                    except Exception:
-                        repaired[p_name] = val
-                # ISO Date Normalization
-                elif target_type in (str, "str") and isinstance(val, str):
-                    clean_val = val.strip()
-                    # Check YYYY/MM/DD or ISO with T
-                    if "/" in clean_val or "T" in clean_val:
-                        for fmt in ("%Y/%m/%d", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%dT%H:%M:%SZ"):
-                            try:
-                                dt = datetime.datetime.strptime(clean_val.split("T")[0] if "T" in clean_val else clean_val, fmt.split("T")[0])
-                                clean_val = dt.strftime("%Y-%m-%d")
-                                break
-                            except ValueError:
-                                pass
-                    repaired[p_name] = clean_val
-                elif target_type in (str, "str") and not isinstance(val, str):
-                    repaired[p_name] = str(val)
-            except (ValueError, TypeError):
-                repaired[p_name] = val
-
-        # Forward extra keys only if target function accepts **kwargs
         sig = inspect.signature(entry.fn)
         has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        if has_var_kwargs:
-            for k, v in raw.items():
-                if k not in repaired:
-                    repaired[k] = v
-
-        return repaired
+        return repair_arguments(entry.parameters, arguments, scorer=self._scorer, forward_extra=has_var_kwargs)
 
     # --------------------------------------------------------------------------
     # 3. GUARD: Execute with loop guard and idempotency boundary

@@ -786,10 +786,28 @@ def load_head_safetensors(path: Path | str, device: str = "cpu") -> dict[str, An
     return _unflatten_head_weights(load_file(str(path), device=device))
 
 
+def _safe_torch_load(path: Path | str, map_location: Any = "cpu", warn: bool = True) -> dict[str, Any]:
+    """Load a pickled head.pt with ``weights_only=True`` (tensors and dicts only).
+
+    Arbitrary pickled objects are refused. Prefer ``head.safetensors``; run
+    ``soro-boro convert-head <dir>`` to write one next to an existing head.pt.
+    """
+    if warn:
+        import warnings
+
+        warnings.warn(
+            f"Loading pickle head weights from {path} with weights_only=True. "
+            "head.safetensors is preferred; convert with `soro-boro convert-head <dir>`.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return torch.load(path, map_location=map_location, weights_only=True)
+
+
 def convert_head_pt_to_safetensors(checkpoint_dir: Path | str) -> Path:
     """Convert an existing checkpoint's head.pt to head.safetensors (head.pt is kept)."""
     path = Path(checkpoint_dir)
-    weights = torch.load(path / "head.pt", map_location="cpu")
+    weights = _safe_torch_load(path / "head.pt", map_location="cpu", warn=False)
     out = path / "head.safetensors"
     save_head_safetensors(weights, out)
     return out
@@ -873,7 +891,7 @@ def load_soro_kev_checkpoint(checkpoint_dir: Path | str, device: str = "cpu") ->
     if head_st_file.exists():
         weights = load_head_safetensors(head_st_file, device=device)
     else:
-        weights = torch.load(head_file, map_location=device)
+        weights = _safe_torch_load(head_file, map_location=device)
     model.q_proj_head.load_state_dict(weights["q_proj_head"])
     model.opt_proj_head.load_state_dict(weights["opt_proj_head"])
     if "binary_head" in weights:
