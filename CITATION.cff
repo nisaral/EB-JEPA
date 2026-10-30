@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use Soro-Boro or the Soro-Kev models, please cite it as below."
+title: "Soro-Boro: calibration-aware tool routing with Soro-Kev pointer models"
+type: software
+authors:
+  - family-names: Nisar
+    given-names: Keyush
+license: Apache-2.0
+version: 0.2.1
+repository-code: "https://github.com/nisaral/Soro-Boro"
+url: "https://huggingface.co/nisaralll/soro-kev-4b"
+keywords:
+  - tool routing
+  - function calling
+  - conformal prediction
+  - AI agents
+  - MCP
+references:
+  - type: software
+    title: "kev-0.8b"
+    authors:
+      - family-names: Palmer
+        given-names: Jared
+    url: "https://huggingface.co/jaredpalmer/kev-0.8b"

@@ -1,0 +1,22 @@
+name: Wrong route / calibration report
+description: The router picked the wrong tool, failed to abstain, or asked when it should act
+labels: [routing-quality]
+body:
+  - type: textarea
+    id: case
+    attributes:
+      label: Query, tool menu, and the decision you got
+      description: Paste `decision.to_dict()` and the tools (any format). Please remove private data first.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: expected
+    attributes:
+      label: Expected tool (or __abstain__)
+    validations:
+      required: true
+  - type: input
+    id: qhat
+    attributes:
+      label: q_hat used (default or override)
