@@ -7,7 +7,7 @@ repos:
     hooks:
       - id: ruff
         args: [--select, "E9,F,I", --line-length, "130", --fix]
-        files: ^(veyra/python/src/soro_boro/(router|server|cli|tool_schema)\.py|examples/.*\.py|tests/test_(examples|readme_snippets|router_api)\.py|scripts/(recalibrate_qhat|per_query_ci|ci_smoke)\.py)$
+        files: ^(veyra/python/src/soro_boro/(router|server|cli|tool_schema|lifecycle)\.py|examples/.*\.py|tests/test_(examples|readme_snippets|router_api)\.py|scripts/(recalibrate_qhat|per_query_ci|ci_smoke)\.py)$
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
