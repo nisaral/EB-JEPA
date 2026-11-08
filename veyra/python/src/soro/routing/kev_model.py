@@ -170,7 +170,11 @@ class SoroKevModel(nn.Module):
                             load_in_4bit=True,
                             bnb_4bit_quant_type="nf4",
                             bnb_4bit_use_double_quant=True,
-                            bnb_4bit_compute_dtype=torch.float16,
+                            # Gemma activations overflow fp16; on GPUs without bf16 (T4) compute in fp32.
+                            bnb_4bit_compute_dtype=(
+                                torch.bfloat16 if torch.cuda.is_bf16_supported()
+                                else (torch.float32 if "gemma" in model_name.lower() else torch.float16)
+                            ),
                         )
                         load_kw["device_map"] = {"": torch.cuda.current_device()}
                     except Exception:

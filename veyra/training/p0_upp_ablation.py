@@ -392,7 +392,7 @@ def main() -> None:
     ap.add_argument("--eval-rows", type=int, default=300)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--max-seq-len", type=int, default=768)
+    ap.add_argument("--max-seq-len", type=int, default=832)  # audit: max prompt 791 tokens
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--out", default=str(REPO / "runs" / "p0_upp"))

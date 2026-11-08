@@ -1,0 +1,65 @@
+{
+  "_comment": "Target mixture for Soro-Kev-Omni v1 (~200k train rows). Buckets are modality/kind. Short buckets are reported, never padded with duplicates.",
+  "seed": 0,
+  "selection_frac": 0.04,
+  "max_per_package_label": 400,
+  "require_teacher_verification": true,
+  "drop_leaked_eval_rows": true,
+  "inputs": [
+    {
+      "path": "runs/omni_data/stage_text/text_base.jsonl"
+    },
+    {
+      "path": "runs/omni_data/stage_text/text_collisions.jsonl"
+    },
+    {
+      "path": "runs/omni_data/verified/text_near_miss.jsonl"
+    },
+    {
+      "path": "runs/omni_data/verified/text_generated.jsonl"
+    },
+    {
+      "path": "runs/omni_data/verified/text_generic.jsonl"
+    },
+    {
+      "path": "runs/omni_data/audio/audio_tts.jsonl"
+    },
+    {
+      "path": "runs/omni_data/image/ui_os_atlas.jsonl"
+    },
+    {
+      "path": "runs/omni_data/image/image_routing.jsonl"
+    },
+    {
+      "path": "runs/omni_data/stage_text/eval_zeroshot.jsonl",
+      "split": "test"
+    },
+    {
+      "path": "runs/omni_data/stage_text/eval_external.jsonl",
+      "split": "test"
+    },
+    {
+      "path": "runs/omni_data/eval/eval_audio2tool.jsonl",
+      "split": "test"
+    },
+    {
+      "path": "runs/omni_data/eval/human_eval.jsonl",
+      "split": "human_eval"
+    }
+  ],
+  "targets": {
+    "text/positive": 45000,
+    "text/collision": 12000,
+    "text/abstain": 8000,
+    "text/near_miss": 8000,
+    "text/need_input": 3000,
+    "image/positive": 30000,
+    "image/collision": 8000,
+    "image/abstain": 6000,
+    "image/near_miss": 3000,
+    "audio/positive": 45000,
+    "audio/collision": 10000,
+    "audio/abstain": 7000,
+    "audio/near_miss": 5000
+  }
+}
