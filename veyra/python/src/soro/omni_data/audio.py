@@ -130,21 +130,49 @@ def prefixes(x: np.ndarray, fractions: tuple[float, ...] = (0.4, 0.6, 0.8)) -> l
 
 
 # ---------------------------------------------------------------------- TTS
+ONNX_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+ONNX_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+
+
 class KokoroTTS:
-    """Kokoro-82M (Apache-2.0). ``pip install kokoro>=0.9.2 soundfile`` and espeak-ng."""
+    """Kokoro-82M (Apache-2.0).
+
+    Uses the ``kokoro`` package when available (Python <= 3.12, needs espeak-ng), otherwise
+    ``kokoro-onnx`` (Python 3.13 OK; model files are fetched once into ``cache_dir``).
+    """
 
     VOICES_EN = ["af_heart", "af_bella", "af_nicole", "af_sarah", "am_adam", "am_michael", "am_fenrir",
                  "bf_emma", "bf_isabella", "bm_george", "bm_lewis"]
 
-    def __init__(self, lang_code: str = "a"):
-        from kokoro import KPipeline
+    def __init__(self, cache_dir: str = "runs/omni_data/kokoro_onnx"):
+        try:
+            from kokoro import KPipeline
 
-        self.pipes = {"a": KPipeline(lang_code="a"), "b": KPipeline(lang_code="b")}
+            self.backend = "kokoro"
+            self.pipes = {"a": KPipeline(lang_code="a"), "b": KPipeline(lang_code="b")}
+        except ImportError:
+            import urllib.request
+
+            from kokoro_onnx import Kokoro
+
+            d = Path(cache_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            model, voices = d / "kokoro-v1.0.onnx", d / "voices-v1.0.bin"
+            for url, path in ((ONNX_MODEL_URL, model), (ONNX_VOICES_URL, voices)):
+                if not path.exists():
+                    urllib.request.urlretrieve(url, path)
+            self.backend = "kokoro-onnx"
+            self.onnx = Kokoro(str(model), str(voices))
 
     def __call__(self, text: str, voice: str, speed_: float = 1.0) -> np.ndarray:
-        pipe = self.pipes["b" if voice.startswith("b") else "a"]
-        chunks = [np.asarray(a, dtype=np.float32) for _, _, a in pipe(text, voice=voice, speed=speed_)]
-        return resample(np.concatenate(chunks) if chunks else np.zeros(1, np.float32), 24000, SR)
+        if self.backend == "kokoro":
+            pipe = self.pipes["b" if voice.startswith("b") else "a"]
+            chunks = [np.asarray(a, dtype=np.float32) for _, _, a in pipe(text, voice=voice, speed=speed_)]
+            audio, sr = (np.concatenate(chunks) if chunks else np.zeros(1, np.float32)), 24000
+        else:
+            audio, sr = self.onnx.create(text, voice=voice, speed=speed_, lang="en-gb" if voice.startswith("b") else "en-us")
+            audio = np.asarray(audio, dtype=np.float32)
+        return resample(audio, sr, SR)
 
 
 def render_rows(rows: list[OmniRow], out_dir: str | Path, tts, voices: list[str], per_row: int = 1,
@@ -198,6 +226,8 @@ def audio2tool_rows(records: list[dict[str, Any]], audio_root: str, distractors:
     rows = []
     for rec in records:
         if rec.get("additional_tool_calls") or rec.get("tier") in ("tier3_multi_intent", "tier8_intent_blending"):
+            continue
+        if "path" not in rec:  # tier7 multi-turn: audio lives per turn in chat_history
             continue
         gold_fn = next((f for f in rec.get("functions") or [] if f["tool_id"] == rec["tool_id"]), None)
         if gold_fn is None:

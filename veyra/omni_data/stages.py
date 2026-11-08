@@ -101,10 +101,16 @@ def cmd_filter(a):
     from soro.omni_data.generate import agree_filter
     from soro.omni_data.text import filter_near_misses
 
+    from soro.omni_data.generate import names_a_tool
+
     rows = list(read_rows(a.inp))
+    n0 = len(rows)
+    rows = [r for r in rows if not ("generated" in r.tags and names_a_tool(r.text, r.options))]
+    d0 = n0 - len(rows)
     rows, d1 = filter_near_misses(rows)
     rows, d2 = agree_filter(rows)
-    print(json.dumps({"kept": write_rows(rows, a.out), "dropped_near_miss": d1, "dropped_generated": d2}))
+    print(json.dumps({"kept": write_rows(rows, a.out), "dropped_names_tool": d0, "dropped_near_miss": d1,
+                      "dropped_generated": d2}))
 
 
 def main():

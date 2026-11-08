@@ -21,6 +21,23 @@ Extras
                     member disagreement is an uncertainty signal.
   * ``exits``       extra pointer readouts at fractional depths (early exit).
   * ``think_slots`` learned pause embeddings before the readout token.
+Option compression and interaction (block layout)
+  * ``gists=g``       each option is compressed into g learned gist tokens inside its
+                      own block; the request attends to the gists only, so a tool's
+                      cache is g tokens and large catalogs fit in one pass. Per-tool
+                      caches are exact and composable in any order.
+  * ``gist_distill``  weight of a self-distillation loss: the gist path is trained to
+                      match the same model reading the full option text.
+  * ``interaction``   ``cross`` (request attends to options) or ``late`` (no
+                      cross-attention; ColBERT-style MaxSim between request tokens and
+                      option gists; a tool's cache is g vectors).
+  * ``option_pool``   option readout: ``last`` token, ``mean`` or learned ``attn`` pooling.
+  * ``gist_budgets``  Matryoshka gists: train with a random budget b per step so the first
+                      b gists of every option are a usable summary on their own. Gist j only
+                      attends to gists < j, so prefixes are nested by construction. One cache
+                      then serves a coarse pass over the whole catalog (1 gist per tool) and a
+                      fine pass over the top-M tools (all gists): retrieval and listwise
+                      reranking in one model (``score_two_level``).
 
 Every head also reports an energy score (logsumexp of logits) and a scalar
 uncertainty ``u`` used for normalized conformal sets.
@@ -62,6 +79,14 @@ class UPPConfig:
     brier_weight: float = 0.25
     exit_weight: float = 0.5
     max_option_chars: int = 400
+    gists: int = 0
+    gist_distill: float = 0.0
+    interaction: str = "cross"  # cross | late
+    option_pool: str = "last"  # last | mean | attn
+    # Block layout: the request starts at this fixed position, so a tool's cache never
+    # depends on which other tools share the catalog (options are truncated to fit).
+    request_offset: int = 640
+    gist_budgets: tuple[int, ...] = field(default_factory=tuple)  # e.g. (1, 2, 4, 8)
 
     def name(self) -> str:
         parts = [self.layout, self.head]
@@ -73,6 +98,16 @@ class UPPConfig:
             parts.append("exits" + "-".join(f"{e:g}" for e in self.exits))
         if self.think_slots:
             parts.append(f"slots{self.think_slots}")
+        if self.gists:
+            parts.append(f"gist{self.gists}")
+        if self.gist_distill:
+            parts.append("gsd")
+        if self.gist_budgets:
+            parts.append("mrl")
+        if self.interaction != "cross":
+            parts.append(self.interaction)
+        if self.option_pool != "last":
+            parts.append(f"pool-{self.option_pool}")
         return "+".join(parts)
 
 
@@ -162,8 +197,45 @@ class UPPHead(nn.Module):
         return logits, aux
 
 
+class AttnPool(nn.Module):
+    """Learned-query attention pooling over a span of token states (NV-Embed-style)."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.zeros(d_model))
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:  # (n, d) -> (d,)
+        hn = self.norm(h.float())
+        w = torch.softmax(hn @ self.query / math.sqrt(hn.shape[-1]), dim=0)
+        return (w.unsqueeze(-1) * h.float()).sum(0)
+
+
+class LateHead(nn.Module):
+    """ColBERT-style late interaction: mean over request tokens of max similarity to option gists."""
+
+    def __init__(self, d_model: int, cfg: UPPConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.norm = nn.LayerNorm(d_model) if cfg.pre_norm else nn.Identity()
+        self.q_in = nn.Linear(d_model, cfg.proj_dim)
+        self.k_in = nn.Linear(d_model, cfg.proj_dim)
+        self.log_temp = nn.Parameter(torch.tensor(math.log(0.05)))
+
+    def forward(self, h_req: torch.Tensor, h_gists: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """h_req: (Lq, d) request token states; h_gists: (K, g, d) -> logits (K,)."""
+        q = F.normalize(self.q_in(self.norm(h_req.float())), dim=-1)
+        k = F.normalize(self.k_in(self.norm(h_gists.float())), dim=-1)
+        sim = torch.einsum("qp,kgp->kqg", q, k)  # (K, Lq, g)
+        score = sim.max(-1).values.mean(-1)
+        logits = score / (torch.exp(self.log_temp) + 1e-4)
+        return logits, {"energy": torch.logsumexp(logits, -1), "u": 1.0 - F.softmax(logits, -1).max()}
+
+
 class UPPModel(nn.Module):
     """Backbone (LoRA) + UPP head. Reuses Soro-Kev's tested backbone loader."""
+
+    GIST_BASE = -100  # token-id markers: -1 think slot, -100 - j gist j
 
     def __init__(
         self,
@@ -174,6 +246,10 @@ class UPPModel(nn.Module):
         torch_dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        if cfg.interaction == "late" and cfg.layout != "block":
+            raise ValueError("interaction='late' needs layout='block'")
+        if cfg.gists and cfg.layout != "block":
+            raise ValueError("gists need layout='block'")
         self.cfg = cfg
         base = SoroKevModel(
             model_name=model_name,
@@ -188,12 +264,17 @@ class UPPModel(nn.Module):
         self._mock_tok = base._tokenize_text
         d_model = base.q_proj_head.in_features
         del base
-        self.head = UPPHead(d_model, cfg)
+        self.head = LateHead(d_model, cfg) if cfg.interaction == "late" else UPPHead(d_model, cfg)
+        self.pool = AttnPool(d_model) if cfg.option_pool == "attn" else None
+        emb = self._embed_layer().weight
+        mean_emb = emb.detach().float().mean(0, keepdim=True)
         self.slots = None
         if cfg.think_slots > 0:
-            emb = self._embed_layer().weight
-            init = emb.detach().float().mean(0, keepdim=True).repeat(cfg.think_slots, 1)
-            self.slots = nn.Parameter(init + 0.02 * torch.randn_like(init))
+            self.slots = nn.Parameter(mean_emb.repeat(cfg.think_slots, 1)
+                                      + 0.02 * torch.randn(cfg.think_slots, emb.shape[1]))
+        self.gist_emb = None
+        if cfg.gists > 0:
+            self.gist_emb = nn.Parameter(mean_emb.repeat(cfg.gists, 1) + 0.02 * torch.randn(cfg.gists, emb.shape[1]))
         if cfg.layout == "block" and not self.is_mock and self._has_linear_attention():
             raise ValueError(
                 f"layout='block' needs full-attention layers; {model_name} has linear-attention "
@@ -204,6 +285,10 @@ class UPPModel(nn.Module):
     @property
     def is_mock(self) -> bool:
         return isinstance(self.backbone, MockCausalBackbone)
+
+    @property
+    def _device(self) -> torch.device:
+        return next(self.head.parameters()).device
 
     def _has_linear_attention(self) -> bool:
         cfg = getattr(self.backbone, "config", None)
@@ -235,8 +320,7 @@ class UPPModel(nn.Module):
             x = embeds + b.pos_emb(pos.clamp(max=b.pos_emb.num_embeddings - 1))
             if mask.dim() == 4:  # additive (B,1,L,L) -> (B*heads, L, L)
                 heads = b.transformer.layers[0].self_attn.num_heads
-                attn = mask[:, 0].repeat_interleave(heads, dim=0).to(x.dtype)
-                h = b.transformer(x, mask=attn)
+                h = b.transformer(x, mask=mask[:, 0].repeat_interleave(heads, dim=0).to(x.dtype))
             else:
                 causal = nn.Transformer.generate_square_subsequent_mask(L, device=embeds.device).bool()
                 h = b.transformer(x, mask=causal, src_key_padding_mask=(mask == 0), is_causal=True)
@@ -251,87 +335,147 @@ class UPPModel(nn.Module):
         return h, hs, getattr(out, "past_key_values", None)
 
     # ------------------------------------------------------------------ layout
+    def _option_tokens(self, i: int, key: str, text: str, budget: int | None) -> list[int]:
+        body = f"{key}: {str(text)[: self.cfg.max_option_chars]}\n"
+        if self.cfg.layout != "block":
+            body = f"[{i}] " + body
+        toks = self._tok(body)
+        return toks[:budget] if budget is not None else toks
+
+    def _request_tokens(self, state: str) -> list[int]:
+        question = f"Question [tool_route]: {ROUTE_INSTRUCTIONS}\n"
+        return self._tok(f"State: {state}\n") + self._tok(question) + [-1] * self.cfg.think_slots + self._tok("Answer:")
+
     def build(self, state: str, criteria: dict[str, str]) -> dict[str, Any]:
-        """Token ids (slot marker -1), positions, block ids, query index and option span ends."""
+        """Token ids (markers: -1 slot, -100-j gist j), positions, blocks and readout indices."""
         cfg = self.cfg
         keys = list(criteria)
-        opt_text = [f"[{i}] {k}: {str(criteria[k])[: cfg.max_option_chars]}\n" for i, k in enumerate(keys)]
         question = f"Question [tool_route]: {ROUTE_INSTRUCTIONS}\n"
-        request = self._tok(f"State: {state}\n") + self._tok(question) + [-1] * cfg.think_slots + self._tok("Answer:")
         ids: list[int] = []
-        opt_ends: list[int] = []
-        blocks: list[int] = []  # -1 prefix, i option i, -2 request
         positions: list[int] = []
+        blocks: list[int] = []  # -1 prefix, i option i, -2 request
+        is_gist: list[bool] = []
+        opt_tokens: list[list[int]] = []
+        opt_gists: list[list[int]] = []
         if cfg.layout == "block":
             prefix = self._tok("Options:\n", special=True)
             ids += prefix
-            blocks += [-1] * len(prefix)
             positions += list(range(len(prefix)))
+            blocks += [-1] * len(prefix)
+            is_gist += [False] * len(prefix)
             p0 = len(prefix)
-            longest = 0
-            for i, t in enumerate(opt_text):
-                toks = self._tok(t.replace(f"[{i}] ", "", 1))  # no index: order-free text
-                ids += toks
-                blocks += [i] * len(toks)
-                positions += list(range(p0, p0 + len(toks)))
-                opt_ends.append(len(ids) - 1)
-                longest = max(longest, len(toks))
+            budget = max(8, cfg.request_offset - p0 - cfg.gists)
+            for i, k in enumerate(keys):
+                toks = self._option_tokens(i, k, criteria[k], budget)
+                start = len(ids)
+                ids += toks + [self.GIST_BASE - j for j in range(cfg.gists)]
+                n_all = len(toks) + cfg.gists
+                positions += list(range(p0, p0 + n_all))
+                blocks += [i] * n_all
+                is_gist += [False] * len(toks) + [True] * cfg.gists
+                opt_tokens.append(list(range(start, start + len(toks))))
+                opt_gists.append(list(range(start + len(toks), start + n_all)))
             catalog_len = len(ids)
-            r0 = p0 + longest
+            request = self._request_tokens(state)
+            r_start = len(ids)
             ids += request
+            positions += list(range(cfg.request_offset, cfg.request_offset + len(request)))
             blocks += [-2] * len(request)
-            positions += list(range(r0, r0 + len(request)))
+            is_gist += [False] * len(request)
+            req_idx = list(range(r_start, len(ids)))
+            q_idx = len(ids) - 1
         elif cfg.layout == "catalog_first":
             ids += self._tok("Options:\n", special=True)
-            for t in opt_text:
-                ids += self._tok(t)
-                opt_ends.append(len(ids) - 1)
+            for i, k in enumerate(keys):
+                start = len(ids)
+                ids += self._option_tokens(i, k, criteria[k], None)
+                opt_tokens.append(list(range(start, len(ids))))
             catalog_len = len(ids)
-            ids += request
+            r_start = len(ids)
+            ids += self._request_tokens(state)
+            req_idx = list(range(r_start, len(ids)))
             positions = list(range(len(ids)))
+            q_idx = len(ids) - 1
         else:
             ids += self._tok(f"State: {state}\n", special=True) + self._tok(question)
             ids += [-1] * cfg.think_slots
             ids += self._tok("Options:\n")
-            q_marker = len(ids) - 1
-            for t in opt_text:
-                ids += self._tok(t)
-                opt_ends.append(len(ids) - 1)
+            q_idx = len(ids) - 1
+            req_idx = list(range(0, q_idx + 1))
+            for i, k in enumerate(keys):
+                start = len(ids)
+                ids += self._option_tokens(i, k, criteria[k], None)
+                opt_tokens.append(list(range(start, len(ids))))
             catalog_len = 0
             positions = list(range(len(ids)))
-            return {"ids": ids, "q_idx": q_marker, "opt_ends": opt_ends, "keys": keys,
-                    "catalog_len": catalog_len, "positions": positions, "blocks": None}
-        return {"ids": ids, "q_idx": len(ids) - 1, "opt_ends": opt_ends, "keys": keys,
-                "catalog_len": catalog_len, "positions": positions, "blocks": blocks or None}
+        if cfg.gists:
+            opt_idx = opt_gists
+        elif cfg.option_pool == "last":
+            opt_idx = [[t[-1]] for t in opt_tokens]
+        else:
+            opt_idx = opt_tokens
+        return {"ids": ids, "positions": positions, "blocks": blocks or None, "is_gist": is_gist or None,
+                "q_idx": q_idx, "req_idx": req_idx, "opt_idx": opt_idx, "opt_tokens": opt_tokens,
+                "opt_gists": opt_gists, "keys": keys, "catalog_len": catalog_len}
 
-    @staticmethod
-    def _block_allowed(blocks: list[int], L: int) -> torch.Tensor:
-        """(L, L) bool: token i may attend token j. Options see the prefix and their own block."""
+    def _block_allowed(self, pk: dict[str, Any], L: int, mode: str) -> torch.Tensor:
+        """(L, L) bool. mode: gist (request sees gists), full (request sees option tokens), none (late)."""
+        blocks, gist = pk["blocks"], pk.get("visible_gist") or pk["is_gist"]
         n = len(blocks)
         b = torch.tensor(blocks)
+        g = torch.tensor(gist[:n])
         i_b, j_b = b.view(n, 1), b.view(1, n)
         causal = torch.ones(n, n, dtype=torch.bool).tril()
         same = i_b == j_b
         to_prefix = j_b == -1
         from_request = i_b == -2
-        allowed = causal & (same | to_prefix | from_request)
+        if mode == "none":
+            # late interaction: the request is encoded completely alone (not even the shared
+            # prefix), so its states are identical whether or not a catalog is in the batch
+            req_sees = torch.zeros(1, n, dtype=torch.bool)
+            to_prefix = to_prefix & ~from_request
+        elif mode == "gist" and self.cfg.gists:
+            req_sees = g.view(1, n)
+        else:  # full: every option token (and gists)
+            req_sees = j_b >= 0
+        allowed = causal & (same | to_prefix | (from_request & req_sees))
         out = torch.zeros(L, L, dtype=torch.bool)
         out[:n, :n] = allowed
         idx = torch.arange(L)
-        out[idx, idx] = True  # padding rows attend to themselves (no NaNs)
+        out[idx, idx] = True
         return out
+
+    def _with_budget(self, pk: dict[str, Any], budget: int | None) -> dict[str, Any]:
+        """Same row, but the request may only read the first ``budget`` gists of each option."""
+        if not self.cfg.gists or budget is None or budget >= self.cfg.gists:
+            return pk
+        vis = [False] * len(pk["ids"])
+        for gi in pk["opt_gists"]:
+            for j in gi[:budget]:
+                vis[j] = True
+        return dict(pk, visible_gist=vis, opt_idx=[gi[:budget] for gi in pk["opt_gists"]])
+
+    def _mode(self, teacher: bool = False) -> str:
+        if self.cfg.interaction == "late":
+            return "none"
+        if teacher:
+            return "full"
+        return "gist" if self.cfg.gists else "full"
 
     def _embed(self, ids: list[int], device: torch.device) -> torch.Tensor:
         emb = self._embed_layer()
         x = emb(torch.tensor([max(i, 0) for i in ids], dtype=torch.long, device=device))
-        if self.slots is not None:
-            slot_pos = [j for j, i in enumerate(ids) if i == -1]
-            if slot_pos:
-                x = x.clone()
+        slot_pos = [j for j, i in enumerate(ids) if i == -1]
+        gist_pos = [(j, self.GIST_BASE - i) for j, i in enumerate(ids) if i <= self.GIST_BASE]
+        if slot_pos or gist_pos:
+            x = x.clone()
+            if slot_pos and self.slots is not None:
                 x[slot_pos] = self.slots.to(x.dtype)
+            if gist_pos and self.gist_emb is not None:
+                x[[p for p, _ in gist_pos]] = self.gist_emb[[gg for _, gg in gist_pos]].to(x.dtype)
         return x
 
-    def _batch(self, packs: list[dict[str, Any]], device: torch.device):
+    def _batch(self, packs: list[dict[str, Any]], device: torch.device, mode: str):
         L = max(len(p["ids"]) for p in packs)
         emb_dim = self._embed_layer().weight.shape[1]
         dtype = self._embed_layer().weight.dtype
@@ -350,14 +494,32 @@ class UPPModel(nn.Module):
             if n < L:
                 positions[b, n:] = positions[b, n - 1] + 1
             if block:
-                mask[b, 0][self._block_allowed(pk["blocks"], L).to(device)] = 0.0
+                mask[b, 0][self._block_allowed(pk, L, mode).to(device)] = 0.0
             else:
                 mask[b, :n] = 1
         return embeds, mask, positions
 
+    # ------------------------------------------------------------------ readout
+    def _pool(self, h: torch.Tensor) -> torch.Tensor:
+        if h.shape[0] == 1:
+            return h[0]
+        if self.pool is not None:
+            return self.pool(h)
+        return h.float().mean(0)
+
+    def _score(self, h: torch.Tensor, pk: dict[str, Any], opt_idx: list[list[int]] | None = None):
+        """Logits for one row from its hidden states (L, d)."""
+        opt_idx = opt_idx or pk["opt_idx"]
+        if self.cfg.interaction == "late":
+            g = max(len(ix) for ix in opt_idx)
+            gist = torch.stack([h[ix + [ix[-1]] * (g - len(ix))] for ix in opt_idx])
+            return self.head(h[pk["req_idx"]], gist)
+        opts = torch.stack([self._pool(h[ix]) for ix in opt_idx])
+        return self.head(h[pk["q_idx"]], opts)
+
     # ------------------------------------------------------------------ forward
     def forward_batch(self, records: list[dict[str, Any]], max_seq_len: int = 1024) -> dict[str, Any]:
-        device = next(self.head.parameters()).device
+        device = self._device
         packs, golds = [], []
         for r in records:
             q = r["questions"]["tool_route"]
@@ -369,16 +531,31 @@ class UPPModel(nn.Module):
         if not packs:
             zero = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
             return {"loss": zero, "skipped": True, "logits": [], "kept": 0}
-        embeds, mask, positions = self._batch(packs, device)
+        if self.cfg.gist_budgets and self.training:
+            b = self.cfg.gist_budgets[int(torch.randint(len(self.cfg.gist_budgets), (1,)))]
+            packs = [self._with_budget(pk, b) for pk in packs]
+        embeds, mask, positions = self._batch(packs, device, self._mode())
         h, exit_hs, _ = self._hidden(embeds, mask, positions)
+        teacher_logits = None
+        if self.cfg.gist_distill > 0 and self.cfg.gists and self.cfg.interaction == "cross":
+            # Same model, request reading the full option text: the gist path learns to match it.
+            with torch.no_grad():
+                t_embeds, t_mask, t_pos = self._batch(packs, device, self._mode(teacher=True))
+                th, _, _ = self._hidden(t_embeds, t_mask, t_pos)
+                teacher_logits = [self._score(th[b], pk, [[t[-1]] for t in pk["opt_tokens"]])[0].detach()
+                                  for b, pk in enumerate(packs)]
         losses, logits_out, us = [], [], []
         n_exit = len(exit_hs)
         for b, pk in enumerate(packs):
             g = golds[b]
-            logits, aux = self.head(h[b, pk["q_idx"]], h[b, pk["opt_ends"]])
-            losses.append(self._row_loss(logits, aux, g))
+            logits, aux = self._score(h[b], pk)
+            row = self._row_loss(logits, aux, g)
+            if teacher_logits is not None:
+                pt = F.softmax(teacher_logits[b], -1)
+                row = row + self.cfg.gist_distill * F.kl_div(F.log_softmax(logits, -1), pt, reduction="sum")
+            losses.append(row)
             for hs in exit_hs:
-                lg_e, aux_e = self.head(hs[b, pk["q_idx"]], hs[b, pk["opt_ends"]])
+                lg_e, aux_e = self._score(hs[b], pk)
                 losses.append(self.cfg.exit_weight / n_exit * self._row_loss(lg_e, aux_e, g))
             logits_out.append(logits)
             us.append(float(aux["u"].detach()))
@@ -392,7 +569,7 @@ class UPPModel(nn.Module):
         oh = torch.zeros_like(p)
         oh[g] = 1.0
         loss = -torch.log(p[g].clamp_min(1e-9)) + self.cfg.brier_weight * ((p - oh) ** 2).mean()
-        if "member_logits" in aux:  # train each ensemble member on its own CE too
+        if "member_logits" in aux:
             loss = loss + F.cross_entropy(aux["member_logits"], torch.full((aux["member_logits"].shape[0],), g,
                                           device=logits.device))
         if "kl" in aux:
@@ -400,51 +577,163 @@ class UPPModel(nn.Module):
         return loss
 
     @torch.no_grad()
-    def score(self, state: str, criteria: dict[str, str]) -> tuple[dict[str, float], dict[str, Any]]:
-        """Probabilities over ``criteria`` for one request, plus uncertainty and exit info."""
-        device = next(self.head.parameters()).device
-        pk = self.build(state, criteria)
-        embeds, mask, positions = self._batch([pk], device)
+    def score(self, state: str, criteria: dict[str, str], budget: int | None = None,
+              ) -> tuple[dict[str, float], dict[str, Any]]:
+        """Probabilities over ``criteria`` for one request, plus uncertainty and exit info.
+
+        ``budget`` limits how many gists per option the request reads (Matryoshka models)."""
+        device = self._device
+        pk = self._with_budget(self.build(state, criteria), budget)
+        embeds, mask, positions = self._batch([pk], device, self._mode())
         h, exit_hs, _ = self._hidden(embeds, mask, positions)
-        logits, aux = self.head(h[0, pk["q_idx"]], h[0, pk["opt_ends"]])
+        logits, aux = self._score(h[0], pk)
         p = F.softmax(logits, -1).float().cpu().tolist()
         info: dict[str, Any] = {"u": float(aux["u"]), "energy": float(aux["energy"])}
         if exit_hs:
             info["exits"] = []
             for hs in exit_hs:
-                lg, _ = self.head(hs[0, pk["q_idx"]], hs[0, pk["opt_ends"]])
+                lg, _ = self._score(hs[0], pk)
                 pe = F.softmax(lg, -1).float().cpu().tolist()
                 info["exits"].append({k: pe[i] for i, k in enumerate(pk["keys"])})
         return {k: p[i] for i, k in enumerate(pk["keys"])}, info
 
-    # ------------------------------------------------------------------ catalog cache
+    # ------------------------------------------------------------------ caching
+    @staticmethod
+    def _select(past: Any, keep: list[int]) -> Any:
+        """A new cache holding only the given key/value positions of ``past``."""
+        from transformers import DynamicCache
+
+        out = DynamicCache()
+        for li, layer in enumerate(past.layers):
+            idx = torch.tensor(keep, device=layer.keys.device)
+            out.update(layer.keys.index_select(2, idx), layer.values.index_select(2, idx), li)
+        return out
+
+    def _prefix_len(self, pk: dict[str, Any]) -> int:
+        return next(i for i, b in enumerate(pk["blocks"]) if b != -1)
+
     @torch.no_grad()
     def encode_catalog(self, criteria: dict[str, str]) -> dict[str, Any]:
-        """Run the options once (catalog_first or block). Reuse for many requests."""
+        """Run the options once (catalog_first or block) and keep what requests need.
+
+        With gists only the prefix and the gist positions are kept (prefix + K*g
+        tokens). Late interaction keeps only the gist vectors, no KV at all.
+        """
         if self.cfg.layout not in ("catalog_first", "block") or self.is_mock:
             raise ValueError("catalog caching needs layout catalog_first/block and a real backbone")
-        device = next(self.head.parameters()).device
+        device = self._device
         pk = self.build("", criteria)
         n = pk["catalog_len"]
         cat = dict(pk, ids=pk["ids"][:n], positions=pk["positions"][:n],
-                   blocks=pk["blocks"][:n] if pk["blocks"] else None)
-        embeds, mask, positions = self._batch([cat], device)
+                   blocks=pk["blocks"][:n] if pk["blocks"] else None,
+                   is_gist=pk["is_gist"][:n] if pk["is_gist"] else None)
+        embeds, mask, positions = self._batch([cat], device, self._mode())
         h, _, past = self._hidden(embeds, mask, positions, use_cache=True)
-        return {"criteria": dict(criteria), "past": past, "h_opts": h[0, pk["opt_ends"]].clone(),
-                "keys": pk["keys"], "catalog_len": n}
+        opt_states = [h[0, ix].clone() for ix in pk["opt_idx"]]
+        prefix_len = self._prefix_len(pk) if pk["blocks"] else 0
+        if self.cfg.interaction == "late":
+            past = None
+        elif self.cfg.gists:
+            keep = list(range(prefix_len)) + [i for ix in pk["opt_gists"] for i in ix]
+            past = self._select(past, keep)
+        return {"criteria": dict(criteria), "past": past, "opt_states": opt_states, "keys": pk["keys"],
+                "catalog_len": n, "prefix_len": prefix_len,
+                "cached_tokens": past.get_seq_length() if past is not None else 0}
 
     @torch.no_grad()
-    def score_cached(self, state: str, cache: dict[str, Any]) -> tuple[dict[str, float], dict[str, Any]]:
-        device = next(self.head.parameters()).device
-        pk = self.build(state, cache["criteria"])
-        n = cache["catalog_len"]
-        x = self._embed(pk["ids"][n:], device).unsqueeze(0)
-        positions = torch.tensor([pk["positions"][n:]], device=device)
-        mask = torch.ones(1, len(pk["ids"]), dtype=torch.long, device=device)  # request sees everything
-        h, _, _ = self._hidden(x, mask, positions, past=copy.deepcopy(cache["past"]), use_cache=True)
-        logits, aux = self.head(h[0, -1], cache["h_opts"])
+    def _score_request(self, state: str, cat: dict[str, Any], fresh: bool = False,
+                       ) -> tuple[dict[str, float], dict[str, Any]]:
+        """Run only the request against a prepared catalog (cached KV or late-interaction vectors).
+
+        The cache is not copied: the request's keys/values are appended and then cropped away,
+        so the catalog cache is unchanged afterwards. ``fresh`` marks a throwaway sub-cache."""
+        device = self._device
+        request = self._request_tokens(state)
+        x = self._embed(request, device).unsqueeze(0)
+        start = self.cfg.request_offset if self.cfg.layout == "block" else cat["catalog_len"]
+        pos = torch.arange(start, start + len(request), device=device).unsqueeze(0)
+        if self.cfg.interaction == "late":
+            h, _, _ = self._hidden(x, torch.ones(1, len(request), dtype=torch.long, device=device), pos)
+            g = max(s.shape[0] for s in cat["opt_states"])
+            gist = torch.stack([torch.cat([s, s[-1:].expand(g - s.shape[0], -1)]) for s in cat["opt_states"]])
+            logits, aux = self.head(h[0], gist)
+        else:
+            mask = torch.ones(1, cat["cached_tokens"] + len(request), dtype=torch.long, device=device)
+            past = cat["past"]
+            try:
+                h, _, _ = self._hidden(x, mask, pos, past=past, use_cache=True)
+            finally:
+                if not fresh:
+                    past.crop(cat["cached_tokens"])  # drop the request's entries; catalog cache unchanged
+            opts = torch.stack([self._pool(s) for s in cat["opt_states"]])
+            logits, aux = self.head(h[0, -1], opts)
         p = F.softmax(logits, -1).float().cpu().tolist()
-        return {k: p[i] for i, k in enumerate(cache["keys"])}, {"u": float(aux["u"])}
+        return {k: p[i] for i, k in enumerate(cat["keys"])}, {"u": float(aux["u"])}
+
+    def score_cached(self, state: str, cache: dict[str, Any]) -> tuple[dict[str, float], dict[str, Any]]:
+        return self._score_request(state, cache)
+
+    # ------------------------------------------------------------------ per-tool composable cache
+    @torch.no_grad()
+    def encode_tool(self, key: str, text: str) -> dict[str, Any]:
+        """Encode one tool in isolation; its cache does not depend on any other tool."""
+        if not (self.cfg.layout == "block" and (self.cfg.gists or self.cfg.interaction == "late")) or self.is_mock:
+            raise ValueError("per-tool caches need layout='block' with gists (or late interaction)")
+        c = self.encode_catalog({key: text})
+        return {"key": key, "past": c["past"], "opt_state": c["opt_states"][0], "prefix_len": c["prefix_len"]}
+
+    def compose(self, tools: list[dict[str, Any]]) -> dict[str, Any]:
+        """Join per-tool caches (any order): the shared prefix once, then each tool's gists."""
+        from transformers import DynamicCache
+
+        past = None
+        if self.cfg.interaction != "late":
+            past = DynamicCache()
+            pl = tools[0]["prefix_len"]
+            for li in range(len(tools[0]["past"].layers)):
+                ks = [tools[0]["past"].layers[li].keys[:, :, :pl]] + [t["past"].layers[li].keys[:, :, pl:] for t in tools]
+                vs = [tools[0]["past"].layers[li].values[:, :, :pl]] + [t["past"].layers[li].values[:, :, pl:] for t in tools]
+                past.update(torch.cat(ks, 2), torch.cat(vs, 2), li)
+        return {"past": past, "opt_states": [t["opt_state"] for t in tools], "keys": [t["key"] for t in tools],
+                "catalog_len": None, "prefix_len": tools[0]["prefix_len"],
+                "cached_tokens": past.get_seq_length() if past is not None else 0}
+
+    def score_composed(self, state: str, catalog: dict[str, Any]) -> tuple[dict[str, float], dict[str, Any]]:
+        return self._score_request(state, catalog)
+
+    def _sub_catalog(self, cat: dict[str, Any], tool_ids: list[int], budget: int) -> dict[str, Any]:
+        """View of a gist catalog with only ``tool_ids`` and their first ``budget`` gists."""
+        g, pl = self.cfg.gists, cat["prefix_len"]
+        keep = list(range(pl)) + [pl + i * g + j for i in tool_ids for j in range(budget)]
+        past = self._select(cat["past"], keep) if cat["past"] is not None else None
+        return {"past": past, "opt_states": [cat["opt_states"][i][:budget] for i in tool_ids],
+                "keys": [cat["keys"][i] for i in tool_ids], "catalog_len": cat.get("catalog_len"),
+                "prefix_len": pl, "cached_tokens": len(keep) if past is not None else 0}
+
+    def score_two_level(self, state: str, cat: dict[str, Any], coarse: int = 1, top_m: int = 16,
+                        fine: int | None = None) -> tuple[dict[str, float], dict[str, Any]]:
+        """Coarse pass over every tool with ``coarse`` gists, then a fine pass over the top-M with
+        ``fine`` gists, both read from the same cache. ``__abstain__`` always reaches the fine pass.
+        With coarse = fine = gists and top_m >= catalog size this equals ``score_cached``."""
+        if not self.cfg.gists or self.cfg.interaction == "late":
+            raise ValueError("two-level scoring needs a cross-interaction gist model")
+        fine = fine or self.cfg.gists
+        n = len(cat["keys"])
+        if coarse >= self.cfg.gists:
+            p_coarse, _ = self._score_request(state, cat)
+        else:
+            p_coarse, _ = self._score_request(state, self._sub_catalog(cat, list(range(n)), coarse), fresh=True)
+        order = sorted(range(n), key=lambda i: -p_coarse[cat["keys"][i]])
+        top = order[:top_m]
+        if "__abstain__" in cat["keys"]:
+            ab = cat["keys"].index("__abstain__")
+            if ab not in top:
+                top = top[: max(0, top_m - 1)] + [ab]
+        top = sorted(top)  # menu order does not matter (order-invariant), keep catalog order
+        p_fine, info = self._score_request(state, self._sub_catalog(cat, top, fine), fresh=True)
+        info.update({"coarse_kept": len(top), "coarse_tokens": cat["prefix_len"] + n * coarse,
+                     "fine_tokens": cat["prefix_len"] + len(top) * fine})
+        return p_fine, info
 
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [p for p in self.parameters() if p.requires_grad]

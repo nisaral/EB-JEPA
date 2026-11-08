@@ -71,13 +71,13 @@ def test_layouts_place_query_and_slots():
     cat = UPPModel(UPPConfig(layout="catalog_first", think_slots=3), use_mock=True)
     pk = cat.build("User Request: hi", crit)
     assert pk["ids"].count(-1) == 3
-    assert max(pk["opt_ends"]) < pk["catalog_len"] <= pk["q_idx"] == len(pk["ids"]) - 1
+    assert max(i for ix in pk["opt_idx"] for i in ix) < pk["catalog_len"] <= pk["q_idx"] == len(pk["ids"]) - 1
     blk = UPPModel(UPPConfig(layout="block"), use_mock=True).build("User Request: hi", crit)
     starts = [blk["positions"][blk["blocks"].index(i)] for i in range(3)]
     assert len(set(starts)) == 1  # every option block starts at the same position
     qf = UPPModel(UPPConfig(layout="query_first"), use_mock=True)
     pk2 = qf.build("User Request: hi", crit)
-    assert pk2["q_idx"] < min(pk2["opt_ends"]) and pk2["catalog_len"] == 0
+    assert pk2["q_idx"] < min(i for ix in pk2["opt_idx"] for i in ix) and pk2["catalog_len"] == 0
 
 
 def test_forward_batch_and_score_run_on_mock():
@@ -91,3 +91,71 @@ def test_forward_batch_and_score_run_on_mock():
     assert model.slots.grad is not None
     probs, info = model.score(rec["state"], rec["questions"]["tool_route"]["criteria"])
     assert abs(sum(probs.values()) - 1.0) < 1e-5 and info["u"] > 0
+
+
+REC = {"state": "User Request: weather in Paris",
+       "questions": {"tool_route": {"criteria": {"get_weather": "weather forecast for a city",
+                                                 "send_email": "send an email", "__abstain__": "none"},
+                                    "label": "get_weather"}}}
+
+
+def test_gist_mask_hides_raw_option_tokens_from_request():
+    m = UPPModel(UPPConfig(layout="block", gists=2), use_mock=True)
+    pk = m.build(REC["state"], REC["questions"]["tool_route"]["criteria"])
+    allowed = m._block_allowed(pk, len(pk["ids"]), "gist")
+    q = pk["q_idx"]
+    raw = [i for t in pk["opt_tokens"] for i in t]
+    gists = [i for g in pk["opt_gists"] for i in g]
+    assert not allowed[q, raw].any() and allowed[q, gists].all()
+    full = m._block_allowed(pk, len(pk["ids"]), "full")
+    assert full[q, raw].all()
+    none = m._block_allowed(pk, len(pk["ids"]), "none")
+    assert not none[q, raw + gists].any()
+    # options never see each other
+    a, b = pk["opt_tokens"][0][-1], pk["opt_tokens"][1][0]
+    assert not allowed[b, a] and not allowed[a, b]
+
+
+def test_block_positions_do_not_depend_on_other_tools():
+    m = UPPModel(UPPConfig(layout="block", gists=2), use_mock=True)
+    crit = REC["questions"]["tool_route"]["criteria"]
+    alone = m.build("x", {"get_weather": crit["get_weather"]})
+    joint = m.build("x", crit)
+    pos_alone = [alone["positions"][i] for i in alone["opt_gists"][0]]
+    pos_joint = [joint["positions"][i] for i in joint["opt_gists"][0]]
+    assert pos_alone == pos_joint
+    assert joint["positions"][joint["q_idx"] - 1] >= m.cfg.request_offset
+
+
+def test_late_interaction_and_gist_distill_train_on_mock():
+    torch.manual_seed(0)
+    late = UPPModel(UPPConfig(layout="block", gists=2, interaction="late"), use_mock=True)
+    out = late.forward_batch([REC, REC])
+    out["loss"].backward()
+    assert late.gist_emb.grad is not None and not out["skipped"]
+    probs, _ = late.score(REC["state"], REC["questions"]["tool_route"]["criteria"])
+    assert abs(sum(probs.values()) - 1) < 1e-5
+    gsd = UPPModel(UPPConfig(layout="block", gists=2, gist_distill=1.0, option_pool="attn"), use_mock=True)
+    out = gsd.forward_batch([REC])
+    out["loss"].backward()
+    assert gsd.gist_emb.grad is not None and gsd.pool is not None  # attn pooling applies to gists too
+    assert gsd.pool.query.grad is not None
+
+
+def test_matryoshka_budget_masks_later_gists_and_trains():
+    torch.manual_seed(0)
+    m = UPPModel(UPPConfig(layout="block", gists=4, gist_budgets=(1, 2, 4)), use_mock=True)
+    pk = m.build(REC["state"], REC["questions"]["tool_route"]["criteria"])
+    b1 = m._with_budget(pk, 1)
+    allowed = m._block_allowed(b1, len(pk["ids"]), "gist")
+    q = pk["q_idx"]
+    first = [g[0] for g in pk["opt_gists"]]
+    later = [i for g in pk["opt_gists"] for i in g[1:]]
+    assert allowed[q, first].all() and not allowed[q, later].any()
+    assert all(len(ix) == 1 for ix in b1["opt_idx"])
+    m.train()
+    out = m.forward_batch([REC, REC])
+    out["loss"].backward()
+    assert m.gist_emb.grad is not None
+    p1, _ = m.eval().score(REC["state"], REC["questions"]["tool_route"]["criteria"], budget=1)
+    assert abs(sum(p1.values()) - 1) < 1e-5

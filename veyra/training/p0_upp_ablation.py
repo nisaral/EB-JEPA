@@ -60,6 +60,15 @@ CONFIGS = {
     "H": UPPConfig(layout="query_first", head="dot", ensemble=4),
     "I": UPPConfig(layout="query_first", head="dot", exits=(0.5, 0.75)),
     "J": UPPConfig(layout="block", head="rbf", refiner=True, ensemble=4, exits=(0.5, 0.75)),
+    # round 3: option compression and interaction
+    "K": UPPConfig(layout="block", gists=4, refiner=True),
+    "K8": UPPConfig(layout="block", gists=8, refiner=True),
+    "Ksd": UPPConfig(layout="block", gists=4, refiner=True, gist_distill=1.0),
+    "L": UPPConfig(layout="block", gists=4, interaction="late"),
+    "P": UPPConfig(layout="block", refiner=True, option_pool="attn"),
+    "J2": UPPConfig(layout="block", gists=4, gist_distill=1.0, head="rbf", refiner=True, ensemble=4),
+    # round 4: Matryoshka gists (one cache for coarse retrieval + fine listwise rerank)
+    "KM": UPPConfig(layout="block", gists=8, gist_budgets=(1, 2, 4, 8), gist_distill=1.0, refiner=True),
 }
 
 DATA = REPO / "releases" / "soro-universal-tool-harness"
@@ -186,10 +195,11 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
         if use_cuda:
             torch.cuda.synchronize()
         lat.append((time.perf_counter() - t0) * 1000)
-        rev = dict(reversed(list(crit.items())))
-        probs_rev, _ = model.score(r["state"], rev)
         top = max(probs, key=probs.get)
-        flips += int(top != max(probs_rev, key=probs_rev.get))
+        if len(crit) <= 64:  # order invariance is exact for block layouts; skip the costly check on huge menus
+            rev = dict(reversed(list(crit.items())))
+            probs_rev, _ = model.score(r["state"], rev)
+            flips += int(top != max(probs_rev, key=probs_rev.get))
         g = gold_key(r, probs)
         ok = is_correct(r, top)
         hit.append(int(ok))
@@ -241,6 +251,28 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
             "policy_acc@0.9": sum(h[-1] for h in exit_hits) / n,
             "policy_mean_depth": sum(exit_depth) / len(exit_depth),
         }
+    if model.cfg.gist_budgets:
+        out["acc_by_budget"] = {}
+        for b in model.cfg.gist_budgets:
+            hit_b = 0
+            for r in rows:
+                pb, _ = model.score(r["state"], r["questions"]["tool_route"]["criteria"], budget=b)
+                hit_b += int(is_correct(r, max(pb, key=pb.get)))
+            out["acc_by_budget"][b] = hit_b / n
+        if not model.is_mock and len(rows[0]["questions"]["tool_route"]["criteria"]) > 24:
+            hit2, lat2 = 0, []
+            for r in rows:
+                cat = model.encode_catalog(r["questions"]["tool_route"]["criteria"])
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                p2, _ = model.score_two_level(r["state"], cat, coarse=1, top_m=16, fine=model.cfg.gists)
+                if use_cuda:
+                    torch.cuda.synchronize()
+                lat2.append((time.perf_counter() - t0) * 1000)
+                hit2 += int(is_correct(r, max(p2, key=p2.get)))
+            out["two_level"] = {"acc": hit2 / n, "latency_ms": statistics.median(lat2), "coarse_budget": 1, "top_m": 16}
+        print(f"  [{name}] acc by gist budget {out['acc_by_budget']} two-level {out.get('two_level')}", flush=True)
     if model.cfg.layout in ("catalog_first", "block") and not model.is_mock:
         cached = []
         for r in rows[:timing_rows]:
@@ -335,6 +367,9 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
     result = {"config": cfg.name(), "trainable_params": n_train, "train_secs": train_secs,
               "steps": steps, "skipped_batches": skipped, "peak_vram_mb": peak, "eval": {}}
     for name, rows in evals.items():
+        if name.startswith("toolret_large") and not (cfg.gists or cfg.interaction == "late"):
+            result["eval"][name] = {"skipped": "full-text layouts cannot read menus this large in one pass"}
+            continue
         result["eval"][name] = evaluate(model, f"{key}/{name}", rows)
     del model, opt
     if device == "cuda":
@@ -369,7 +404,10 @@ def markdown(results: dict[str, Any]) -> str:
                      "| Err-AUROC u / energy / maxprob | Early exit acc @ depth | Latency ms | Cached ms |")
         lines.append("| :-- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |")
         for key, res in results.items():
-            e = res["eval"][split]
+            e = res["eval"].get(split, {})
+            if "skipped" in e or not e:
+                lines.append(f"| {key} {res['config']} | skipped |" + " |" * 12)
+                continue
             norm = e.get("conformal_normalized")
             norm_s = f"{norm['set_size']:.2f} @ {norm['coverage']:.3f}" if norm else "-"
             ref = "-" if e["refusal"] is None else f"{e['refusal']:.2f} ({e['abstain_rows']})"
@@ -397,6 +435,10 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=100)
     ap.add_argument("--out", default=str(REPO / "runs" / "p0_upp"))
     ap.add_argument("--data-dir", default=None, help="Folder with train.jsonl and val_zeroshot.jsonl")
+    ap.add_argument("--toolret", type=int, default=0, help="Add N ToolRet queries as eval splits (0 = off)")
+    ap.add_argument("--toolret-k", type=int, default=16, help="Menu size for the main ToolRet split")
+    ap.add_argument("--toolret-k-large", type=int, default=0, help="Extra ToolRet split with a larger menu (0 = off)")
+    ap.add_argument("--toolret-large-n", type=int, default=300, help="Queries in the large-menu ToolRet split")
     ap.add_argument("--load-in-4bit", action="store_true")
     ap.add_argument("--no-grad-ckpt", action="store_true", help="Disable gradient checkpointing (faster, more VRAM)")
     ap.add_argument("--smoke", action="store_true", help="Tiny CPU run with a mock backbone")
@@ -414,6 +456,21 @@ def main() -> None:
         "zeroshot": zs[::stride][: args.eval_rows],
         "bfcl": load_bfcl(),
     }
+    toolret_stats = {}
+    if args.toolret and not args.smoke:
+        from toolret_data import build as build_toolret
+
+        for name, k in (("toolret", args.toolret_k), ("toolret_large", args.toolret_k_large)):
+            if not k:
+                continue
+            recs, st = build_toolret(n=args.toolret if name == "toolret" else args.toolret_large_n, k=k)
+            toolret_stats[name] = st
+            # pointer accuracy is measured where the gold tool made it into the menu
+            evals[f"{name}_k{k}"] = [r for r in recs if r["gold_in_menu"]]
+            print(f"{name}: k={k} recall@k={st['recall_at_k']:.3f} first-stage acc@1={st['first_stage_acc1']:.3f} "
+                  f"train overlap={st['train_query_overlap']}", flush=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     evals = {k: v for k, v in evals.items() if v}
     train_rows = train_all[: args.train_rows]
     if args.smoke:
@@ -428,6 +485,8 @@ def main() -> None:
     results: dict[str, Any] = {}
     for key in [k.strip() for k in args.configs.split(",") if k.strip()]:
         results[key] = train_one(key, CONFIGS[key], args, train_rows, evals)
+        if toolret_stats:
+            results[key]["toolret_first_stage"] = toolret_stats
         (out_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     md = markdown(results)
     (out_dir / "results.md").write_text(md, encoding="utf-8")

@@ -109,6 +109,8 @@ def to_rows(generated: list[dict[str, Any]], parents: dict[str, OmniRow], model_
         parent = parents.get(g["parent"])
         if not req or parent is None:
             continue
+        if names_a_tool(req, parent.options):
+            continue
         opts = list(parent.options)
         if g["intended_label"] == ABSTAIN:
             opts = [o for o in opts if o.key != g["target"]]
@@ -121,6 +123,12 @@ def to_rows(generated: list[dict[str, Any]], parents: dict[str, OmniRow], model_
                             group=f"gen-{parent.group}", tags=tags + ["needs_teacher"], teacher=None,
                             meta={"parent": parent.id, "generator": model_id, "kind": g["kind"]}))
     return rows
+
+
+def names_a_tool(request: str, options) -> bool:
+    """True when the request spells out a tool key (the answer leaks into the input)."""
+    low = request.lower()
+    return any(o.kind == "tool" and len(o.key) > 4 and o.key.lower() in low for o in options)
 
 
 def agree_filter(rows: list[OmniRow], min_prob: float = 0.5) -> tuple[list[OmniRow], int]:

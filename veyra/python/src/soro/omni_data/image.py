@@ -26,6 +26,29 @@ from soro.omni_data.schema import ABSTAIN, OmniRow, Option, special_option
 _TEMPLATES = ["Click {x}", "Tap {x}", "Open {x}", "Select {x}", "Go to {x}", "Press {x}", "{x}"]
 
 
+_VERBS = ("click", "tap", "select", "open", "press", "go ", "choose", "tag", "toggle", "type", "enter",
+          "swipe", "scroll", "check", "uncheck", "switch", "turn", "find", "view", "show", "pick", "hit")
+
+
+def _as_request(rng: random.Random, expr: str) -> str:
+    """Referring expressions that already start with an action verb are used as they are."""
+    return expr[0].upper() + expr[1:] if expr.lower().startswith(_VERBS) else rng.choice(_TEMPLATES).format(x=expr)
+
+
+def region_text(bbox: list[float], kind: str | None = None) -> str:
+    """Neutral option text for a UI element: where it is and how big, never what it says.
+
+    The request names the element; if options carried their referring text too, a model
+    could match strings without looking at the screen. With region-only options the
+    screenshot has to decide."""
+    l, t, r, b = bbox
+    cx, cy = (l + r) / 2, (t + b) / 2
+    col = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
+    row = "top" if cy < 0.33 else ("bottom" if cy > 0.66 else "middle")
+    k = f"{kind} " if kind else ""
+    return f"{k}element at {row}-{col} (x={cx:.2f}, y={cy:.2f}, w={r - l:.2f}, h={b - t:.2f})"
+
+
 def _clean(s: str) -> str:
     return " ".join(str(s).split())[:200]
 
@@ -42,7 +65,13 @@ def os_atlas_rows(records: list[dict[str, Any]], image_root: str, subsource: str
                   menu_size: int = 8, absent_rate: float = 0.12, max_per_image: int = 3, seed: int = 0) -> list[OmniRow]:
     rng = random.Random(seed)
     by_img: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for rec in records:
+    flat: list[dict[str, Any]] = []
+    for rec in records:  # UIBert and others nest elements: {"img_filename", "elements": [...]}
+        if isinstance(rec.get("elements"), list):
+            flat += [{"img_filename": rec["img_filename"], **e} for e in rec["elements"]]
+        else:
+            flat.append(rec)
+    for rec in flat:
         ins = _clean(rec.get("instruction", ""))
         if len(ins) < 2 or not _valid_bbox(rec.get("bbox")):
             continue
@@ -63,22 +92,23 @@ def os_atlas_rows(records: list[dict[str, Any]], image_root: str, subsource: str
             twins = [e for e in others if e["text"].lower() == target["text"].lower()]
             menu = [target] + twins + [e for e in others if e not in twins][: max(0, menu_size - 1 - len(twins))]
             rng.shuffle(menu)
-            opts = [Option(key=f"el{i}", text=e["text"] + (f" ({e['type']})" if e.get("type") else ""),
+            opts = [Option(key=f"el{i}", text=region_text(e["bbox"], e.get("type") or None),
                            kind="ui_element", bbox=e["bbox"]) for i, e in enumerate(menu)]
             opts.append(special_option(ABSTAIN))
             label = f"el{menu.index(target)}"
-            text = rng.choice(_TEMPLATES).format(x=target["text"])
+            text = _as_request(rng, target["text"])
             tags = ["ui", f"os_atlas:{subsource}"] + (["twin"] if twins else [])
             rid = f"osa-{subsource}-{Path(img).stem}-{k}"
             if rng.random() < absent_rate and len(images) > 1:
                 other_img = rng.choice([i for i in images if i != img])
                 foreign = rng.choice(by_img[other_img])["text"]
                 if all(foreign.lower() != e["text"].lower() for e in elems):
-                    text, label, tags = rng.choice(_TEMPLATES).format(x=foreign), ABSTAIN, tags + ["absent"]
+                    text, label, tags = _as_request(rng, foreign), ABSTAIN, tags + ["absent"]
             rows.append(OmniRow(id=rid, task="ui_point", modality="image", options=opts, label=label,
                                 source="os_atlas", license=license, group=f"osa-{Path(img).stem}",
                                 text=text, image=str(Path(image_root) / img), package=f"os_atlas/{subsource}",
-                                tags=tags, meta={"n_elements_on_screen": len(elems)}))
+                                tags=tags, meta={"n_elements_on_screen": len(elems),
+                                                 "referring_expression": target["text"]}))
     return rows
 
 

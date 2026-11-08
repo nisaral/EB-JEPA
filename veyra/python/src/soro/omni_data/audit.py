@@ -97,8 +97,10 @@ def audit(paths: list[str], tokenizer: str | None = None) -> dict[str, Any]:
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(tokenizer)
-    files = {Path(p).stem: list(read_rows(p)) for p in paths}
-    report: dict[str, Any] = {"files": {k: audit_file(v, tok) for k, v in files.items()}}
+    missing = [p for p in paths if not Path(p).exists()]
+    files = {Path(p).stem: list(read_rows(p)) for p in paths if Path(p).exists()}
+    report: dict[str, Any] = {"missing_files": missing,
+                              "files": {k: audit_file(v, tok) for k, v in files.items() if v}}
     train = [r for rows in files.values() for r in rows if r.split in ("train", "selection")]
     tests = defaultdict(list)
     for name, rows in files.items():
