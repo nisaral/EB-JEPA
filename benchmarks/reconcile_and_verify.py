@@ -27,11 +27,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PRED_DIR = REPO_ROOT / "benchmarks" / "predictions"
 
 SYSTEM_DISPLAY_NAMES = {
-    "bm25": "BM25 (Calibrated Abstention)",
-    "dense_cosine": "Dense Cosine (Calibrated Abstention)",
-    "cross_encoder": "Cross-Encoder (Calibrated Abstention)",
-    "option_logits": "Untrained Option Logits (Zero-shot)",
-    "base_kev_0.8b": "jaredpalmer/kev-0.8b (Base Checkpoint)",
+    "bm25": "BM25 (fixed abstain τ)",
+    "dense_cosine": "Dense MiniLM-L6 cosine (fixed abstain τ)",
+    "cross_encoder": "NLI cross-encoder DeBERTa-v3-small (fixed abstain τ)",
+    "option_logits": "Qwen3.5-0.8B-Base option letters (untrained)",
     "soro_0.8b": "Soro-Kev-0.8B (Ours)",
     "soro_4b": "Soro-Kev-4B (Ours)",
     "arch_router": "Arch-Router-1.5B (Katanemo)",
@@ -395,7 +394,6 @@ def main():
         "dense_cosine",
         "cross_encoder",
         "option_logits",
-        "base_kev_0.8b",
         "soro_0.8b",
         "soro_4b",
         "arch_router",
@@ -426,8 +424,7 @@ def main():
         "> with mathematical consistency checks enforced via `reconcile_and_verify.py`.\n\n"
         "### Table 1: External Held-Out Generalization (1,200 rows across 115 unique base queries)\n\n"
         "> **Note on Query Stratification**: The 1,200 evaluations comprise 115 unique base queries tested across ~10 format/distractor views\n"
-        "> (1,095 reference MCP rows + 105 $\\tau^2$ persona-dialogue rows). Soro-Kev-4B achieves **96.89% (1,061/1,095)** on reference MCP tools\n"
-        "> and **24.76% (26/105)** on $\\tau^2$, where 64.56% of misses are calibrated abstentions or preliminary status checks.\n\n"
+        "> (1,095 reference MCP rows + 105 $\\tau^2$ persona-dialogue rows). Rows of one base query are correlated; see `per_query_ci.json`.\n\n"
         f"{t1_md}\n\n"
         "### Table 2: External Held-Out Per-Package Breakdown (1,200 rows)\n\n"
         f"{t2_md}\n\n"
@@ -440,10 +437,11 @@ def main():
         "> which is insufficient to ground general abstention claims. Refusal and abstention capabilities are evaluated\n"
         "> against 33 dedicated adversarial irrelevance distractors from official BFCL v3.\n\n"
         f"{t4_md}\n\n"
-        "> *\\*Hardware & Latency Note (RTX 4050 6GB Laptop GPU, Windows WDDM):*\n"
-        "> - **Architecture Difference (Prefill vs. Autoregressive Decode):** Soro-Kev outputs routing + key-mapping decisions scoring candidate tools and an explicit `__abstain__` anchor via a dual linear pointer head in **1 single prefill forward pass** (124.2 ms for 0.8B, 648.6 ms for 4B) with 0 generated decode tokens. In contrast, generative models (`xLAM-2-1b-fc-r`, `Hammer2.1-1.5b`) generate full JSON tool calls with argument values (~27–32 decode tokens), requiring 1 prefill pass plus 24-32 sequential autoregressive decode steps (one forward pass per token).\n"
-        "> - **In-VRAM vs. Sustained / Paged Latency:** In clean isolated VRAM bursts, `Arch-Router-1.5B` achieves a median latency of **1,212.9 ms** (~24 tokens generated). `xLAM-2-1b-fc-r` (mean prompt 406 tokens, mean gen 27 tokens) achieves **7,106.9 ms** median in clean VRAM (initial queries: ~1,458-2,549 ms; laptop GPU thermal throttling at 85C settles to ~7.1s). `Hammer2.1-1.5b` (generating full markdown JSON arrays of ~32 tokens) settles to **10,564.5 ms** median. When multiple generative models were evaluated sequentially without intermediate process garbage collection, Windows WDDM silently paged KV caches into Shared GPU Memory across PCIe, increasing latencies to ~10.4s-11.5s.\n"
-        "> - **Dense Cosine & Neural Baselines:** All 100 BFCL rows for Dense Cosine were evaluated directly using `SentenceTransformer` / `all-MiniLM-L6-v2` forward passes on CUDA timed with `time.perf_counter()`, yielding a genuine hardware median latency of **8.5 ms** (6.3-60.4 ms range, 64/100 correct).\n"
+        "> *Latency* is the median measured wall-clock of each system's own forward pass(es) on an RTX 4050 Laptop GPU\n"
+        "> (`time.perf_counter()` with CUDA sync), as recorded per row in the prediction files. Generative baselines\n"
+        "> (Arch-Router, xLAM, Hammer) include their decode steps. Baseline abstain thresholds are fixed constants, not fitted.\n"
+        "> Soro-Kev rows were scored with the v0.2.1 inference prompt. The training-aligned prompt (default since v0.2.2)\n"
+        "> changed accuracy by at most 5 of 300 rows per split in a 700-row A/B on both checkpoints.\n"
     )
 
     print(full_md)

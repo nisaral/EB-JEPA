@@ -41,6 +41,19 @@ MUTATION_TERMS = {
 
 import zlib
 
+# The exact instruction every tool_route training row carries.
+TRAIN_ROUTE_INSTRUCTIONS = "Which single tool or skill should run for this request? Use only the listed candidates."
+LEGACY_ROUTE_INSTRUCTIONS = "Which single tool should run for this request? Use only the listed tools."
+_STATE_PREFIXES = ("User Request:", "User:", "Agent:", "Prior tool observation:")
+
+
+def route_state(query: str) -> str:
+    """Wrap a bare query the way training states are written ("User Request: ...")."""
+    text = query.strip()
+    if text.startswith(_STATE_PREFIXES):
+        return text
+    return f"User Request: {text}"
+
 
 def _hash_token(token: str, num_dims: int = 256) -> list[int]:
     h = zlib.crc32(token.encode("utf-8"))
@@ -377,13 +390,20 @@ class LocalKevScorer:
         """Convenience method for tool choice probabilities."""
         if not options:
             return {}
+        model = self._neural_model if self.load() else None
+        if getattr(model, "prompt_format", "train") == "legacy":
+            instructions = LEGACY_ROUTE_INSTRUCTIONS
+            state = query
+        else:
+            instructions = TRAIN_ROUTE_INSTRUCTIONS
+            state = route_state(query)
         questions = {
             "tool": {
                 "type": "choice",
-                "instructions": "Which single tool should run for this request? Use only the listed tools.",
+                "instructions": instructions,
                 "criteria": options,
             }
         }
-        res = self.evaluate_turn(query, questions)
+        res = self.evaluate_turn(state, questions)
         probs = res.get("probabilities", {}).get("tool", {})
         return {k: float(probs.get(k, 0.0)) for k in options}

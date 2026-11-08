@@ -123,6 +123,9 @@ class SoroKevModel(nn.Module):
         self.tokenizer = None
         # Training may pass a short cap. Inference never uses a cap under 4096.
         self.inference_max_seq_len = 4096
+        # "train" scores menus with the same prompt layout forward_batch trains on.
+        # "legacy" is the pre-0.2.2 inference layout, kept for A/B comparison.
+        self.prompt_format = os.environ.get("SORO_KEV_PROMPT_FORMAT", "train")
 
         if use_mock:
             self.backbone = MockCausalBackbone(vocab_size=2000, hidden_size=128)
@@ -257,7 +260,11 @@ class SoroKevModel(nn.Module):
         max_seq_len: int,
     ) -> tuple[list[int], int, list[int], list[str]] | None:
         opt_keys = list(criteria.keys())
-        q_prefix = f"State: {state}\nQuestion: {instructions}\nOptions:\n"
+        if getattr(self, "prompt_format", "train") == "legacy":
+            q_prefix = f"State: {state}\nQuestion: {instructions}\nOptions:\n"
+        else:
+            # Same layout as forward_batch: "State: ...\n" then "Question [tool_route]: ...".
+            q_prefix = f"State: {state}\nQuestion [tool_route]: {instructions}\nOptions:\n"
         if self.tokenizer is not None:
             prefix_toks = self.tokenizer.encode(q_prefix, add_special_tokens=True)
         else:

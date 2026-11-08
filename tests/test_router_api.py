@@ -273,3 +273,42 @@ def test_old_harness_registered_tools_no_warning():
     with warnings.catch_warnings():
         warnings.simplefilter("error", DeprecationWarning)
         assert h.route("What plan is user 123 on?").selected_tool == "check_plan"
+
+
+class FirstPositionScorer:
+    """Order-sensitive scorer: the first listed tool always gets the most mass."""
+
+    q_hat = 0.95
+    backend_name = "first-position"
+
+    def __init__(self):
+        self.menus = []
+
+    def probabilities(self, query, options):
+        self.menus.append(list(options))
+        tools = [k for k in options if k != "__abstain__"]
+        out = {k: 0.1 / max(len(tools) - 1, 1) for k in tools}
+        out[tools[0]] = 0.85
+        out["__abstain__"] = 0.05
+        return out
+
+
+def test_permutations_rotate_and_average():
+    scorer = FirstPositionScorer()
+    router = Router(scorer, permutations=3)
+    decision = router.route("anything", {"a": "A", "b": "B", "c": "C"})
+    firsts = [menu[0] for menu in scorer.menus]
+    assert firsts == ["a", "b", "c"]
+    assert all(menu[-1] == "__abstain__" for menu in scorer.menus)
+    # Position bias cancels out: every tool ends with the same averaged mass.
+    tool_probs = [decision.scores[k] for k in ("a", "b", "c")]
+    assert max(tool_probs) - min(tool_probs) < 1e-9
+    assert decision.action == Action.ASK
+
+
+def test_permutations_capped_by_menu_and_validated():
+    scorer = FirstPositionScorer()
+    Router(scorer).route("q", {"a": "A", "b": "B"}, permutations=10)
+    assert len(scorer.menus) == 2
+    with pytest.raises(ValueError):
+        Router(scorer, permutations=0)

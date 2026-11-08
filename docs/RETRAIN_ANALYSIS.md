@@ -10,7 +10,7 @@ Retraining makes sense only to fix **model-quality** limitations. Two of them ar
 
 | Limitation | Evidence (committed logs) | Can it be fixed without retraining? |
 | :--- | :--- | :--- |
-| 0.8B no-tool refusal regression | BFCL irrelevance: 17/33 refused, versus 27/33 for base `kev-0.8b` | **Partly.** Tightening q̂ to 0.1 gives 23/33 (see below). Fully closing the gap needs data. |
+| 0.8B no-tool refusal regression | BFCL irrelevance: 17/33 refused (the earlier base `kev-0.8b` comparison was removed: its predictions are not reproducible from this repo) | **Partly.** Tightening q̂ to 0.1 gives 23/33 (see below). Fully closing the gap needs data. |
 | τ² routing | 10.5% (0.8B) and 24.8% (4B) on 105 τ² rows | **No.** This is a domain gap. It needs τ²-style training rows. |
 | Order sensitivity (causal attention) | README claims 1.5–3.0% flips (no committed script) | Inference-time permutation averaging (k passes). Retraining with JSD for 4B. |
 | Small, correlated eval (115 queries) | Cluster CIs are about ±5 pp | Not a training problem. Needs more eval data. |
@@ -70,7 +70,7 @@ threshold separates them. At q̂ = 0.1 on the larger sets, 0.8B abstains on 22.3
 
 **Recommendation:** for refusal-sensitive deployments, use `Router.from_pretrained(..., q_hat=0.1)`
 or the 4B model. This is tuned on 100 BFCL rows, so validate it on your own traffic. The remaining
-gap to base `kev-0.8b` (27/33) needs **data**, not gate tuning.
+remaining refusal gap needs **data**, not gate tuning.
 
 ## If you do retrain (v0.3)
 

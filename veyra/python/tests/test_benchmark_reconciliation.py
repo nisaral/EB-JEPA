@@ -103,7 +103,7 @@ def test_zeroshot_reconciliation(system: str):
     assert abs(weighted_acc - (total_correct / total_n)) < 1e-9
 
 
-@pytest.mark.parametrize("system", ["bm25", "dense_cosine", "cross_encoder", "option_logits", "base_kev_0.8b", "soro_0.8b", "soro_4b", "arch_router", "xlam_1b", "hammer_1.5b", "kev_27b"])
+@pytest.mark.parametrize("system", ["bm25", "dense_cosine", "cross_encoder", "option_logits", "soro_0.8b", "soro_4b", "arch_router", "xlam_1b", "hammer_1.5b", "kev_27b"])
 def test_bfcl_reconciliation(system: str):
     pred_path = PRED_DIR / "bfcl" / f"{system}.jsonl"
     if not pred_path.exists():

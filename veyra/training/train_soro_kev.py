@@ -93,7 +93,7 @@ def _legacy_example_rlcd(
 
 
 def stratified_val_sample(records: list[dict[str, Any]], n: int, seed: int = 0) -> list[dict[str, Any]]:
-    """Even sample across format and delex so a 400-row mid-epoch eval matches the file."""
+    """Even sample across format and delex so a small mid-epoch eval matches the file."""
     if len(records) <= n:
         return list(records)
     groups: dict[tuple, list[dict[str, Any]]] = {}
@@ -111,6 +111,27 @@ def stratified_val_sample(records: list[dict[str, Any]], n: int, seed: int = 0) 
             if bucket and len(picked) < n:
                 picked.append(bucket.pop())
     return picked
+
+
+def split_selection_packages(
+    records: list[dict[str, Any]], frac: float = 0.05, seed: int = 42
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Hold out whole train packages for model selection and q_hat.
+
+    Packages are picked by a seeded shuffle, so the split is the same on every
+    rank and every run. No package appears on both sides.
+    """
+    packages = sorted({str(r.get("package", "")) for r in records})
+    if frac <= 0 or len(packages) < 2:
+        return records, []
+    rng = random.Random(seed)
+    rng.shuffle(packages)
+    n_hold = max(1, int(round(len(packages) * frac)))
+    held = set(packages[:n_hold])
+    train = [r for r in records if str(r.get("package", "")) not in held]
+    select = [r for r in records if str(r.get("package", "")) in held]
+    rng.shuffle(select)
+    return train, select
 
 
 def run_split_conformal_val(
@@ -212,6 +233,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument("--select-frac", type=float, default=0.05,
+                        help="Fraction of train packages held out for checkpoint selection and q_hat")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     print(f"=== Initializing Soro-Kev Training (Profile: {args.profile} | Model: {args.base_model} | Batch Size: {args.batch_size}) ===")
@@ -219,7 +243,6 @@ def main():
     out_path = Path(args.output_dir)
     data_path = Path(args.data_dir)
     train_file = data_path / "train.jsonl"
-    val_file = data_path / "val_zeroshot.jsonl"
 
     if not train_file.exists():
         raise FileNotFoundError(f"Dataset not found at {train_file}. Run build_universal_dataset.py first.")
@@ -227,7 +250,20 @@ def main():
     train_records = []
     with train_file.open(encoding="utf-8") as f:
         for line in f:
-            train_records.append(json.loads(line))
+            if line.strip():
+                train_records.append(json.loads(line))
+
+    # Checkpoint selection and q_hat come from packages carved out of train.jsonl.
+    # val_zeroshot.jsonl and the external held-out file are never read here, so
+    # the numbers reported on them stay held out.
+    train_records, val_records = split_selection_packages(
+        train_records, frac=args.select_frac, seed=args.seed
+    )
+    print(
+        f"Selection split: {len(val_records)} rows from "
+        f"{len({r.get('package') for r in val_records})} train packages held out"
+    )
+
     extra_file = data_path / "external_intent.jsonl"
     if extra_file.exists():
         extra_n = 0
@@ -238,11 +274,8 @@ def main():
                     extra_n += 1
         print(f"Added {extra_n} external intent rows from {extra_file.name}")
 
-    val_records = []
-    if val_file.exists():
-        with val_file.open(encoding="utf-8") as f:
-            for line in f:
-                val_records.append(json.loads(line))
+    # The file is grouped by source. Shuffle once so a step does not see one source only.
+    random.Random(args.seed).shuffle(train_records)
 
     is_smoke = (args.profile == "cpu_smoke")
     # T4 is Turing sm_75: 16 GB, fp16 tensor cores, no bf16.
@@ -307,7 +340,7 @@ def main():
         if major >= 8 and local_rank == 0:
             print("This GPU can run bf16. Profile kaggle_t4 stays on fp16 to match T4 tensor cores.")
     print(
-        f"Loaded {len(train_records)} train records | {len(val_records)} zero-shot val records | "
+        f"Loaded {len(train_records)} train records | {len(val_records)} selection records | "
         f"Batch/GPU: {batch_size} | Grad accum: {args.grad_accum} | World: {world_size} | Device: {device} | "
         f"dtype: {'fp16' if use_fp16 else 'fp32'}"
     )
@@ -341,6 +374,7 @@ def main():
     warmup_steps = 1 if is_smoke else 100
     best_val_score = -1.0
     best_q_hat = 0.90
+    last_q_hat: float | None = None
     step_idx = 0
     t0 = time.time()
 
@@ -420,7 +454,7 @@ def main():
             logged_steps = 0
             t0 = time.time()
 
-        # Mid-epoch eval is a 400-row stratified slice. Full val runs at epoch boundaries.
+        # Mid-epoch eval is a 300-row stratified slice of the selection split. Full split at epoch boundaries.
         # Rank 0 holds the val file. The other rank waits, or the next training
         # allreduce starts while rank 0 is still scoring and the job hangs.
         steps_per_epoch = max(1, math.ceil(len(train_records) / batch_size))
@@ -433,8 +467,8 @@ def main():
                 eval_records = val_records
                 eval_label = "full"
             else:
-                eval_records = stratified_val_sample(val_records, 80, seed=step_idx)
-                eval_label = "subsample-80"
+                eval_records = stratified_val_sample(val_records, 300, seed=step_idx)
+                eval_label = "subsample-300"
             print(f"--- Split conformal val ({eval_label}, n={len(eval_records)}, step {step_idx}) ---")
             val_res = run_split_conformal_val(
                 raw_model,
@@ -444,7 +478,7 @@ def main():
                 max_seq_len=max_seq_len,
             )
             print(
-                f"Zero-Shot Route Acc: {val_res['val_route_acc'] * 100:.2f}% | "
+                f"Selection Route Acc: {val_res['val_route_acc'] * 100:.2f}% | "
                 f"Coverage: {val_res['empirical_coverage'] * 100:.2f}% (Wilson: [{val_res['wilson_ci'][0]*100:.1f}%, {val_res['wilson_ci'][1]*100:.1f}%]) | "
                 f"Mean |S|: {val_res['mean_set_size']:.2f} | "
                 f"Singleton Rate: {val_res['singleton_rate'] * 100:.2f}% | "
@@ -452,6 +486,8 @@ def main():
                 flush=True,
             )
             score = val_res["val_route_acc"] + val_res["singleton_rate"]
+            if math.isfinite(val_res["q_hat"]):
+                last_q_hat = val_res["q_hat"]
             if val_res["n_scored"] < 20 or not math.isfinite(val_res["q_hat"]):
                 print("--> Validation scored too few rows. Not saving.", flush=True)
             elif score > best_val_score:
@@ -464,8 +500,14 @@ def main():
             dist.barrier()
 
     if local_rank == 0:
-        print(f"=== Training Complete! Saving final checkpoint to {out_path} ===")
-        save_soro_kev_checkpoint(raw_model, out_path, q_hat=best_q_hat)
+        # The best checkpoint in out_path keeps its own weights and q_hat. The last
+        # step goes to out_path/last with the q_hat measured on those weights.
+        if best_val_score < 0:
+            print(f"=== Training Complete! No validated checkpoint. Saving final weights to {out_path} ===")
+            save_soro_kev_checkpoint(raw_model, out_path, q_hat=last_q_hat)
+        else:
+            print(f"=== Training Complete! Best checkpoint is in {out_path}; last step saved to {out_path / 'last'} ===")
+            save_soro_kev_checkpoint(raw_model, out_path / "last", q_hat=last_q_hat)
     print("Checkpoint saved successfully: head.pt + config.json + temperature.json.")
 
 

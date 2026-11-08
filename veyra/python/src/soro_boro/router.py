@@ -134,7 +134,11 @@ class Router:
         scorer: Scorer | None = None,
         q_hat: float | None = None,
         tools: Iterable[Any] | Mapping[str, Any] | None = None,
+        permutations: int = 1,
     ) -> None:
+        if int(permutations) < 1:
+            raise ValueError(f"permutations must be >= 1, got {permutations}")
+        self.permutations = int(permutations)
         if scorer is None:
             from soro.routing.kev_local import LocalKevScorer
 
@@ -217,8 +221,14 @@ class Router:
         query: str,
         tools: Iterable[Any] | Mapping[str, Any] | None = None,
         q_hat: float | None = None,
+        permutations: int | None = None,
     ) -> RoutingDecision:
-        """Route ``query`` to one of ``tools`` (OpenAI / MCP / LangChain / dict / callable)."""
+        """Route ``query`` to one of ``tools`` (OpenAI / MCP / LangChain / dict / callable).
+
+        ``permutations=k`` scores k rotations of the tool order and averages the
+        probabilities. This damps the causal backbone's order sensitivity at k times
+        the cost. q_hat was calibrated on single passes; recalibrate for k > 1.
+        """
         from soro.harness.pipeline import conformal_gate
 
         if not isinstance(query, str) or not query.strip():
@@ -232,8 +242,7 @@ class Router:
 
         options = {s.name: (s.description or s.name) for s in specs}
         options[ABSTAIN_KEY] = ABSTAIN_TEXT
-        raw = self.scorer.probabilities(query, options) or {}
-        probs = {k: float(raw.get(k, 0.0)) for k in options}
+        probs = self._scored(query, options, permutations if permutations is not None else self.permutations)
         probs = dict(sorted(probs.items(), key=lambda kv: kv[1], reverse=True))
 
         action, selected, s_tools, threshold, reason = conformal_gate(probs, eff_q)
@@ -246,6 +255,25 @@ class Router:
         top = selected or s_tools[0]
         return RoutingDecision(Action(action), top, s_tools, probs, probs.get(top, 0.0), eff_q, threshold,
                                reason, self.backend, query, by_name)
+
+    def _scored(self, query: str, options: dict[str, str], permutations: int) -> dict[str, float]:
+        """Probabilities over ``options``, averaged over k rotations of the tool order.
+
+        Rotations are deterministic (no RNG), and ``__abstain__`` stays last as in
+        the single-pass layout.
+        """
+        names = [k for k in options if k != ABSTAIN_KEY]
+        k = max(1, min(int(permutations), len(names) or 1))
+        total = {key: 0.0 for key in options}
+        for shift in range(k):
+            order = names[shift:] + names[:shift]
+            menu = {n: options[n] for n in order}
+            menu[ABSTAIN_KEY] = options[ABSTAIN_KEY]
+            raw = self.scorer.probabilities(query, menu) or {}
+            for key in total:
+                total[key] += float(raw.get(key, 0.0))
+        probs = {key: v / k for key, v in total.items()}
+        return dict(sorted(probs.items(), key=lambda kv: kv[1], reverse=True))
 
     def route_batch(self, queries: Iterable[str], tools: Iterable[Any] | Mapping[str, Any] | None = None,
                     q_hat: float | None = None) -> list[RoutingDecision]:

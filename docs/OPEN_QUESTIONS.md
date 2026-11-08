@@ -16,7 +16,7 @@ not in the repo. None of them changes the code.
 5. **Licenses.** Upstream licenses for MCPAgentBench, `catalog_paraphrase`, Toucan and ToolACE.
    See `DATA_LICENSES.md`.
 6. **Does the 0.8B abstention regression matter for the target use?** On BFCL irrelevance the
-   0.8B model refuses 17/33, versus 27/33 for base `kev-0.8b`. Options: raise q̂, add more
+   0.8B model refuses 17/33 (the earlier base `kev-0.8b` comparison was removed: its predictions are not reproducible from this repo). Options: raise q̂, add more
    no-tool training rows, or recommend the 4B model when false calls are costly.
    See `docs/RETRAIN_ANALYSIS.md`.
 7. **τ² performance.** τ² rows score 10.5% (0.8B) and 24.8% (4B). Is τ² in scope? If it is, it

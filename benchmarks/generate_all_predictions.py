@@ -145,149 +145,145 @@ class BM25Scorer:
         return res, latency
 
 
+def _with_abstain(tool_probs: Dict[str, float], top_score: float, threshold: float) -> Dict[str, float]:
+    """Attach an __abstain__ mass from a fixed (not fitted) threshold on the top raw score."""
+    if top_score < threshold:
+        p_abstain = min(0.95, (threshold - top_score) / max(abs(threshold), 1e-6) * 0.8 + 0.2)
+    else:
+        p_abstain = 0.02
+    scale = 1.0 - p_abstain
+    res = {k: v * scale for k, v in tool_probs.items()}
+    res["__abstain__"] = p_abstain
+    return res
+
+
+def _softmax(scores: Dict[str, float], temp: float) -> Dict[str, float]:
+    mx = max(scores.values())
+    exp_s = {k: math.exp((v - mx) / temp) for k, v in scores.items()}
+    tot = sum(exp_s.values())
+    return {k: v / tot for k, v in exp_s.items()}
+
+
+def _sync(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 class DenseCosineScorer:
-    def __init__(self, num_dims: int = 512, abstain_threshold: float = 0.25, device: str = "cpu"):
-        self.num_dims = num_dims
+    """Bi-encoder retrieval: sentence-transformers/all-MiniLM-L6-v2 cosine similarity.
+
+    Predictions and latency both come from the same MiniLM forward pass.
+    The abstain threshold is a fixed constant, not fitted on any split.
+    """
+
+    MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+
+    def __init__(self, abstain_threshold: float = 0.25, device: str = "cpu"):
+        from sentence_transformers import SentenceTransformer
+
         self.abstain_threshold = abstain_threshold
         self.device = device
-        self.minilm_model = None
-        self.minilm_tok = None
-        if device == "cuda" and torch.cuda.is_available():
-            try:
-                from transformers import AutoTokenizer, AutoModel
-                self.minilm_tok = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-                self.minilm_model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2").to("cuda")
-                self.minilm_model.eval()
-            except Exception:
-                pass
-
-    def _embed(self, text: str) -> List[float]:
-        vec = [0.0] * self.num_dims
-        tokens = tokenize(text)
-        for t in tokens:
-            h = abs(hash(t)) % self.num_dims
-            vec[h] += 1.0
-            if len(t) >= 3:
-                for i in range(len(t) - 2):
-                    sub_h = abs(hash(t[i:i+3])) % self.num_dims
-                    vec[sub_h] += 0.5
-        norm = math.sqrt(sum(v * v for v in vec))
-        return [v / norm for v in vec] if norm > 0.0 else vec
+        self.model = SentenceTransformer(self.MODEL_ID, device=device)
 
     def score(self, query: str, candidates: Dict[str, str]) -> Tuple[Dict[str, float], float]:
-        t0 = time.perf_counter()
-        q_vec = self._embed(query)
         tool_candidates = {k: v for k, v in candidates.items() if k != "__abstain__"}
         if not tool_candidates:
-            latency = (time.perf_counter() - t0) * 1000
-            return {"__abstain__": 1.0}, latency
-
-        raw_sims = {}
-        for name, desc in tool_candidates.items():
-            c_vec = self._embed(parse_candidate_text(name, desc))
-            sim = sum(a * b for a, b in zip(q_vec, c_vec))
-            raw_sims[name] = max(sim, 0.0001)
-
-        max_sim = max(raw_sims.values()) if raw_sims else 0.0
-        exp_s = {k: math.exp(v / 0.12) for k, v in raw_sims.items()}
-        sum_exp = sum(exp_s.values())
-        tool_probs = {k: v / sum_exp for k, v in exp_s.items()}
-
-        if max_sim < self.abstain_threshold:
-            p_abstain = min(0.95, (self.abstain_threshold - max_sim) / self.abstain_threshold * 0.8 + 0.2)
-            scale = 1.0 - p_abstain
-            res = {k: v * scale for k, v in tool_probs.items()}
-            res["__abstain__"] = p_abstain
-        else:
-            p_abstain = 0.02
-            scale = 0.98
-            res = {k: v * scale for k, v in tool_probs.items()}
-            res["__abstain__"] = p_abstain
-        
-        # When evaluating on CUDA, time genuine MiniLM GPU forward pass
-        if self.minilm_model is not None:
-            cands_list = [parse_candidate_text(k, desc) for k, desc in tool_candidates.items()]
-            inputs = self.minilm_tok([query] + cands_list, padding=True, truncation=True, max_length=128, return_tensors="pt").to("cuda")
-            torch.cuda.synchronize()
-            t_gpu = time.perf_counter()
-            with torch.no_grad():
-                out = self.minilm_model(**inputs)
-            torch.cuda.synchronize()
-            gpu_lat = (time.perf_counter() - t_gpu) * 1000.0
-            return res, gpu_lat
-
-        compute_lat = (time.perf_counter() - t0) * 1000
-        return res, compute_lat
+            return {"__abstain__": 1.0}, 0.0
+        names = list(tool_candidates)
+        texts = [query] + [parse_candidate_text(k, tool_candidates[k]) for k in names]
+        _sync(self.device)
+        t0 = time.perf_counter()
+        emb = self.model.encode(texts, convert_to_tensor=True, normalize_embeddings=True)
+        sims = (emb[1:] @ emb[0]).float().cpu().tolist()
+        _sync(self.device)
+        latency = (time.perf_counter() - t0) * 1000
+        raw = {k: float(s) for k, s in zip(names, sims)}
+        return _with_abstain(_softmax(raw, 0.05), max(raw.values()), self.abstain_threshold), latency
 
 
 class CrossEncoderScorer:
-    def __init__(self, abstain_threshold: float = 2.0, device: str = "cpu"):
+    """Zero-shot NLI cross-encoder: cross-encoder/nli-deberta-v3-small.
+
+    Each (request, "The request needs the tool <name>: <description>") pair is
+    scored jointly; the tool score is the entailment logit. The abstain
+    threshold on the top entailment probability is fixed, not fitted.
+    """
+
+    MODEL_ID = "cross-encoder/nli-deberta-v3-small"
+    ENTAILMENT = 1  # id2label: 0 contradiction, 1 entailment, 2 neutral
+
+    def __init__(self, abstain_threshold: float = 0.5, device: str = "cpu"):
+        from sentence_transformers import CrossEncoder
+
         self.abstain_threshold = abstain_threshold
         self.device = device
+        self.model = CrossEncoder(self.MODEL_ID, device=device, max_length=256)
 
     def score(self, query: str, candidates: Dict[str, str]) -> Tuple[Dict[str, float], float]:
-        t0 = time.perf_counter()
-        q_tokens = set(tokenize(query))
         tool_candidates = {k: v for k, v in candidates.items() if k != "__abstain__"}
         if not tool_candidates:
-            latency = (time.perf_counter() - t0) * 1000
-            return {"__abstain__": 1.0}, latency
-
-        raw_scores = {}
-        for name, desc in tool_candidates.items():
-            parsed = parse_candidate_text(name, desc)
-            d_tokens = set(tokenize(parsed))
-            overlap = len(q_tokens & d_tokens)
-            jaccard = overlap / max(len(q_tokens | d_tokens), 1)
-            name_bonus = 1.5 if any(qt in name.lower() for qt in q_tokens if len(qt) > 3) else 1.0
-            score = (overlap * 1.5 + jaccard * 6.0) * name_bonus
-            raw_scores[name] = score
-
-        max_score = max(raw_scores.values()) if raw_scores else 0.0
-        exp_s = {k: math.exp(v / 2.0) for k, v in raw_scores.items()}
-        sum_exp = sum(exp_s.values())
-        tool_probs = {k: v / sum_exp for k, v in exp_s.items()}
-
-        if max_score < self.abstain_threshold:
-            p_abstain = min(0.95, (self.abstain_threshold - max_score) / self.abstain_threshold * 0.8 + 0.2)
-            scale = 1.0 - p_abstain
-            res = {k: v * scale for k, v in tool_probs.items()}
-            res["__abstain__"] = p_abstain
-        else:
-            p_abstain = 0.02
-            scale = 0.98
-            res = {k: v * scale for k, v in tool_probs.items()}
-            res["__abstain__"] = p_abstain
-        compute_lat = (time.perf_counter() - t0) * 1000
-        # When evaluating neural baseline on CUDA, include measured RTX 4050 cross-encoder forward-pass latency
-        neural_lat = (12.44 + random.Random(hash(query)).uniform(-0.25, 0.25)) if self.device == "cuda" else 0.0
-        return res, compute_lat + neural_lat
+            return {"__abstain__": 1.0}, 0.0
+        names = list(tool_candidates)
+        pairs = [
+            (query, f"The request needs the tool {parse_candidate_text(k, tool_candidates[k])}")
+            for k in names
+        ]
+        _sync(self.device)
+        t0 = time.perf_counter()
+        logits = self.model.predict(pairs, convert_to_numpy=True, show_progress_bar=False)
+        _sync(self.device)
+        latency = (time.perf_counter() - t0) * 1000
+        ent_logit = {k: float(row[self.ENTAILMENT]) for k, row in zip(names, logits)}
+        ent_prob = {
+            k: float(math.exp(row[self.ENTAILMENT]) / sum(math.exp(x) for x in row))
+            for k, row in zip(names, logits)
+        }
+        return _with_abstain(_softmax(ent_logit, 1.0), max(ent_prob.values()), self.abstain_threshold), latency
 
 
 class UntrainedOptionLogitsScorer:
+    """Untrained readout: the base Qwen3.5-0.8B LM picks an option letter.
+
+    The menu (tools plus a "none of these" option) is listed as A, B, C, ...
+    and the next-token logits over those letters are the scores. No LoRA,
+    no pointer head, no fine-tuning: this is what the backbone knows alone.
+    """
+
+    MODEL_ID = "Qwen/Qwen3.5-0.8B-Base"
+    LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
     def __init__(self, device: str = "cpu"):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
         self.device = device
+        dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        self.tok = AutoTokenizer.from_pretrained(self.MODEL_ID)
+        self.model = AutoModelForCausalLM.from_pretrained(self.MODEL_ID, dtype=dtype).to(device)
+        self.model.eval()
+        self.letter_ids = [self.tok.encode(" " + c, add_special_tokens=False)[0] for c in self.LETTERS]
 
     def score(self, query: str, candidates: Dict[str, str]) -> Tuple[Dict[str, float], float]:
-        t0 = time.perf_counter()
-        q_tokens = set(tokenize(query))
-        raw_logits = {}
-        for idx, (k, desc) in enumerate(candidates.items()):
+        names = [k for k in candidates if k != "__abstain__"] + ["__abstain__"]
+        lines = []
+        for i, k in enumerate(names):
             if k == "__abstain__":
-                raw_logits[k] = 1.5
-                continue
-            parsed = parse_candidate_text(k, desc)
-            d_tokens = set(tokenize(parsed))
-            matches = len(q_tokens & d_tokens)
-            raw_logits[k] = matches * 1.4 + (1.0 if any(qt in k.lower() for qt in q_tokens) else 0.0)
-
-        max_l = max(raw_logits.values()) if raw_logits else 0.0
-        exp_l = {k: math.exp((v - max_l) / 1.6) for k, v in raw_logits.items()}
-        sum_exp = sum(exp_l.values())
-        compute_lat = (time.perf_counter() - t0) * 1000
-        # When evaluating neural baseline on CUDA, include measured RTX 4050 causal LM option forward-pass latency
-        neural_lat = (49.5 + random.Random(hash(query)).uniform(-0.4, 0.4)) if self.device == "cuda" else 0.0
-        return {k: v / sum_exp for k, v in exp_l.items()}, compute_lat + neural_lat
+                lines.append(f"{self.LETTERS[i]}. none: None of the listed tools fit the request.")
+            else:
+                lines.append(f"{self.LETTERS[i]}. {parse_candidate_text(k, candidates[k])[:400]}")
+        prompt = (
+            f"User request: {query}\n\nTools:\n" + "\n".join(lines)
+            + "\n\nWhich option should handle the request? Answer with one letter.\nAnswer:"
+        )
+        ids = self.tok(prompt, return_tensors="pt", truncation=True, max_length=4096).to(self.device)
+        _sync(self.device)
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            logits = self.model(**ids).logits[0, -1].float()
+        _sync(self.device)
+        latency = (time.perf_counter() - t0) * 1000
+        sub = logits[self.letter_ids[: len(names)]]
+        probs = torch.softmax(sub, dim=-1).cpu().tolist()
+        return {k: float(p) for k, p in zip(names, probs)}, latency
 
 
 # ---------------------------------------------------------

@@ -56,164 +56,164 @@
     },
     "dense_cosine": {
       "total": [
-        595,
+        950,
         1200
       ],
       "misclassification_rate": [
-        605,
+        250,
         1200
       ],
       "non_abstain": [
-        501,
+        900,
         1065
       ],
       "abstain": [
-        94,
+        50,
         135
       ],
       "strictly_disjoint": [
-        510,
+        848,
         1038
       ],
       "shared_tools": [
-        85,
+        102,
         162
       ],
       "per_package": {
         "mcp_benchmark/system_mcp": [
-          206,
+          303,
           370
         ],
         "mcp_benchmark/geo_mcp": [
-          189,
+          310,
           364
         ],
         "mcp_benchmark/media_mcp": [
-          163,
+          302,
           361
         ],
         "tau2/telecom": [
-          25,
+          32,
           85
         ],
         "tau2/retail": [
-          12,
+          3,
           20
         ]
       },
       "conformal": {
-        "mean_coverage": 0.9008,
-        "std_coverage": 0.0175,
-        "mean_set_size": 4.1127,
-        "std_set_size": 0.1444
+        "mean_coverage": 0.9036,
+        "std_coverage": 0.0158,
+        "mean_set_size": 1.5383,
+        "std_set_size": 0.0994
       }
     },
     "cross_encoder": {
       "total": [
-        681,
+        288,
         1200
       ],
       "misclassification_rate": [
-        519,
+        912,
         1200
       ],
       "non_abstain": [
-        618,
+        187,
         1065
       ],
       "abstain": [
-        63,
+        101,
         135
       ],
       "strictly_disjoint": [
-        600,
+        279,
         1038
       ],
       "shared_tools": [
-        81,
+        9,
         162
       ],
       "per_package": {
         "mcp_benchmark/system_mcp": [
-          234,
+          75,
           370
         ],
         "mcp_benchmark/geo_mcp": [
-          205,
+          93,
           364
         ],
         "mcp_benchmark/media_mcp": [
-          208,
+          113,
           361
         ],
         "tau2/telecom": [
-          26,
+          6,
           85
         ],
         "tau2/retail": [
-          8,
+          1,
           20
         ]
       },
       "conformal": {
-        "mean_coverage": 0.881,
-        "std_coverage": 0.0139,
-        "mean_set_size": 4.2401,
-        "std_set_size": 0.1754
+        "mean_coverage": 0.9028,
+        "std_coverage": 0.0172,
+        "mean_set_size": 4.8309,
+        "std_set_size": 0.1035
       }
     },
     "option_logits": {
       "total": [
-        707,
+        249,
         1200
       ],
       "misclassification_rate": [
-        493,
+        951,
         1200
       ],
       "non_abstain": [
-        642,
+        249,
         1065
       ],
       "abstain": [
-        65,
+        0,
         135
       ],
       "strictly_disjoint": [
-        618,
+        209,
         1038
       ],
       "shared_tools": [
-        89,
+        40,
         162
       ],
       "per_package": {
         "mcp_benchmark/system_mcp": [
-          245,
+          77,
           370
         ],
         "mcp_benchmark/geo_mcp": [
-          203,
+          70,
           364
         ],
         "mcp_benchmark/media_mcp": [
-          214,
+          78,
           361
         ],
         "tau2/telecom": [
-          35,
+          18,
           85
         ],
         "tau2/retail": [
-          10,
+          6,
           20
         ]
       },
       "conformal": {
-        "mean_coverage": 0.9004,
-        "std_coverage": 0.0188,
-        "mean_set_size": 3.016,
-        "std_set_size": 0.1172
+        "mean_coverage": 0.9037,
+        "std_coverage": 0.0172,
+        "mean_set_size": 5.0623,
+        "std_set_size": 0.0855
       }
     },
     "soro_0.8b": {
@@ -343,45 +343,45 @@
     },
     "dense_cosine": {
       "total": [
-        1022,
+        1387,
         2220
       ],
       "clean": [
-        1011,
+        1362,
         2168
       ],
       "collision": [
-        11,
+        25,
         52
       ],
       "collision_only": false
     },
     "cross_encoder": {
       "total": [
-        1122,
+        302,
         2220
       ],
       "clean": [
-        1116,
+        298,
         2168
       ],
       "collision": [
-        6,
+        4,
         52
       ],
       "collision_only": false
     },
     "option_logits": {
       "total": [
-        1054,
+        390,
         2220
       ],
       "clean": [
-        1043,
+        381,
         2168
       ],
       "collision": [
-        11,
+        9,
         52
       ],
       "collision_only": false
@@ -482,11 +482,11 @@
           33
         ]
       },
-      "median_latency_ms": 0.07
+      "median_latency_ms": 0.11
     },
     "dense_cosine": {
       "total": [
-        64,
+        69,
         100
       ],
       "by_file": {
@@ -495,49 +495,7 @@
           34
         ],
         "BFCL_v3_live_multiple.json": [
-          20,
-          33
-        ],
-        "BFCL_v3_irrelevance.json": [
-          11,
-          33
-        ]
-      },
-      "median_latency_ms": 8.49
-    },
-    "cross_encoder": {
-      "total": [
-        58,
-        100
-      ],
-      "by_file": {
-        "BFCL_v3_multiple.json": [
-          33,
-          34
-        ],
-        "BFCL_v3_live_multiple.json": [
-          20,
-          33
-        ],
-        "BFCL_v3_irrelevance.json": [
-          5,
-          33
-        ]
-      },
-      "median_latency_ms": 12.59
-    },
-    "option_logits": {
-      "total": [
-        59,
-        100
-      ],
-      "by_file": {
-        "BFCL_v3_multiple.json": [
-          31,
-          34
-        ],
-        "BFCL_v3_live_multiple.json": [
-          20,
+          28,
           33
         ],
         "BFCL_v3_irrelevance.json": [
@@ -545,28 +503,49 @@
           33
         ]
       },
-      "median_latency_ms": 49.65
+      "median_latency_ms": 19.57
     },
-    "base_kev_0.8b": {
+    "cross_encoder": {
       "total": [
-        84,
+        40,
         100
       ],
       "by_file": {
         "BFCL_v3_multiple.json": [
-          34,
+          19,
           34
         ],
         "BFCL_v3_live_multiple.json": [
-          23,
+          10,
           33
         ],
         "BFCL_v3_irrelevance.json": [
-          27,
+          11,
           33
         ]
       },
-      "median_latency_ms": 110.96071057620672
+      "median_latency_ms": 317.03
+    },
+    "option_logits": {
+      "total": [
+        26,
+        100
+      ],
+      "by_file": {
+        "BFCL_v3_multiple.json": [
+          15,
+          34
+        ],
+        "BFCL_v3_live_multiple.json": [
+          11,
+          33
+        ],
+        "BFCL_v3_irrelevance.json": [
+          0,
+          33
+        ]
+      },
+      "median_latency_ms": 456.84
     },
     "soro_0.8b": {
       "total": [
