@@ -1,0 +1,288 @@
+% One Cache, Any Catalog -- SIGIR 2027 full-paper draft (anonymous review).
+% Build: latexmk -pdf main.tex   (needs acmart; Overleaf has it)
+% Status (9 Nov 2026): method, formal properties, exactness and latency are measured.
+% Every number in \pending{} is not measured yet and must be filled from the P0 grid / main runs.
+\documentclass[sigconf,review,anonymous]{acmart}
+\usepackage{booktabs}
+\usepackage{amsmath,amsthm}
+\usepackage{xcolor}
+\newcommand{\pending}[1]{\textcolor{orange}{[#1]}}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newcommand{\method}{MGP}
+
+\setcopyright{none}
+\acmConference[SIGIR '27]{Proceedings of the 50th International ACM SIGIR Conference on Research and Development in Information Retrieval}{July 2027}{San Jose, CA, USA}
+
+\begin{document}
+
+\title{One Cache, Any Catalog: Matryoshka Gist Pointers for Calibrated, Order-Invariant Tool Selection at Scale}
+
+\author{Anonymous Author(s)}
+\affiliation{\institution{Anonymous Institution}\country{}}
+
+\begin{abstract}
+Tool-using agents must pick one action from catalogs of hundreds to thousands of tools, and must recognise when no tool fits.
+Listwise LLM rerankers and pointer-style routers make the finest distinctions, but they re-read every tool description on every request, they cannot fit large catalogs in context, and their decisions change when the same tools are listed in a different order.
+We present \emph{Matryoshka Gist Pointers} (\method{}), a decision model that reads a catalog once.
+Each tool is encoded in isolation, with catalog-independent positions, and summarised into a small set of nested \emph{gist} tokens whose key--value states are cached per tool.
+A request attends to the cached gists of any subset of tools, in any order, and a pointer head scores every tool plus an explicit abstain option; split-conformal prediction turns the scores into execute / ask / abstain decisions with a coverage guarantee.
+We prove, and verify numerically, that \method{}'s scores are exactly equivariant to catalog order (max deviation $1.6\times10^{-6}$ in fp32, versus $0.246$ for a pointer router), that per-tool caches compose exactly, and that one cache serves every gist budget, which yields a two-level coarse-to-fine decision from a single model.
+On ToolRet, a first-stage retriever recovers the gold tool in its top-16 for only 47.7\% of queries but in its top-1{,}024 for 91.0\%; \method{} reads 1{,}024 tools in 110\,ms on a laptop GPU, where a pointer router cannot run beyond 64.
+Because the request is the only part that changes, the same text cache also serves spoken requests and requests about a screenshot: on an omni backbone (Gemma~4 E2B) speech and image soft tokens enter the request block and every property above still holds.
+\pending{Accuracy at 16/64/256/1024 tools vs.\ rerankers, abstention AUROC and conformal coverage on BFCL / When2Call; speech vs.\ transcript gap; screenshot pointing.}
+\end{abstract}
+
+\keywords{tool retrieval, listwise reranking, KV caching, context compression, conformal prediction, LLM agents, spoken and multimodal requests}
+
+\maketitle
+
+%=====================================================================
+\section{Introduction}
+%=====================================================================
+An agent that can call thousands of tools faces a ranking problem with three unusual requirements.
+First, distinctions are fine-grained: \texttt{create\_calendar\_event} and \texttt{create\_reminder} share most of their vocabulary, and the right choice depends on argument structure and intent.
+Second, the catalog is large and changes per user and per session (MCP servers are attached and detached at run time), so a model that memorises tool identities in its vocabulary~\cite{wang2025toolgen} must be retrained whenever the catalog changes.
+Third, the decision must be \emph{calibrated}: when no tool fits, the agent should ask or abstain rather than act~\cite{ross2025when2call,patil2025bfcl}.
+
+Existing systems give up one of these.
+Bi-encoders~\cite{shi2025toolret,lu2025tooldenroll} scale but blur near-duplicates; ToolRet reports that strong IR embedders reach only 34--47 nDCG@10 on tool retrieval~\cite{shi2025toolret}.
+Cross-encoders and listwise LLM rerankers~\cite{sun2023rankgpt,reddy2024first,wang2025jinav3} are accurate but cost one long prefill per request over every candidate, and listwise models are sensitive to the order of the candidates~\cite{liu2024lost,zheng2024pride}.
+Pointer-style routers that read the request and the full menu and point at one option (the ``Kev'' family of decision models) add an abstain option but inherit both problems: on our data 85\% of every prefill is static menu text, reversing the menu shifts the chosen probability by up to $0.246$, and the menu cannot exceed a few dozen tools.
+
+Concurrent systems work cache tool schemas per tool~\cite{fang2026recache,arslan2026nexus} or block cross-candidate attention in rerankers~\cite{bito2026invarirank,schlatt2025setencoder}.
+They show that isolation costs little accuracy, but they generate free-form calls, keep the full schema in cache, and do not offer calibrated abstention or an exact order guarantee.
+\method{} is a \emph{decision} model built around four ideas:
+\begin{enumerate}
+  \item \textbf{Block-isolated tools at catalog-independent positions}, with the request at a fixed position offset, so tool states never depend on which other tools are present or where they are listed (\S\ref{sec:block}).
+  \item \textbf{Nested (Matryoshka) gists}: $g$ learned summary tokens per tool, trained with random budgets so the first $b$ gists suffice on their own. A tool's cache is $g$ KV entries (0.047\,MB in bf16 for $g{=}4$ on a 0.5B backbone) (\S\ref{sec:gist}).
+  \item \textbf{Two-level decisions from one cache}: a coarse pass over gist~1 of every tool and a fine pass over all gists of the top-$M$, i.e.\ retrieval and listwise reranking in one model (\S\ref{sec:two}).
+  \item \textbf{A pointer head with abstain and split-conformal sets}, giving execute / ask / abstain actions whose coverage does not depend on how the client orders its tools (\S\ref{sec:conf}).
+  \item \textbf{Any request modality over one text cache}: on an omni backbone the request may be speech or carry a screenshot; its soft tokens sit in the request block, so the catalog cache, the proofs and the conformal guarantee are unchanged (\S\ref{sec:mm}).
+\end{enumerate}
+We contribute (i) the architecture and its training recipe; (ii) three properties---composition, order equivariance, budget nesting---with proofs and numerical checks (\S\ref{sec:props}); (iii) an evaluation on ToolRet at 16 to 1{,}024 candidates, on abstention benchmarks, on spoken and screenshot requests, and on latency and memory (\S\ref{sec:exp}); and (iv) code, weights and per-tool caches.
+
+%=====================================================================
+\section{Related Work}\label{sec:related}
+%=====================================================================
+\paragraph{Tool retrieval and selection.}
+Tool-learning benchmarks such as ToolBench~\cite{qin2024toolllm}, Gorilla/BFCL~\cite{patil2024gorilla,patil2025bfcl} and When2Call~\cite{ross2025when2call} evaluate whether a model calls the right tool and whether it declines when none fits.
+ToolRet~\cite{shi2025toolret} unifies 35 task sets over a 43k-tool corpus and shows that IR-strong embedders transfer poorly to tools; follow-ups expand tool documents and fine-tune embedders and rerankers (Tool-DE, Tool-Embed/Tool-Rank~\cite{lu2025tooldenroll}).
+Training-free candidate compression (Toollery~\cite{tian2026toollery}) and learned tool embeddings (NTILC~\cite{krikorian2026ntilc}) reduce what the LLM sees to a top-$K$ list; a 2026 study~\cite{zhou2026paradox} shows that end-to-end selection degrades even when top-$K$ recall is near perfect.
+ToolGen~\cite{wang2025toolgen} turns each tool into a vocabulary token, which removes the menu from the prompt but ties the model to a fixed catalog.
+\method{} sits between these: it reads up to thousands of candidates listwise like a reranker, while the per-tool cost is paid once, offline.
+
+\paragraph{Listwise reranking and order sensitivity.}
+RankGPT~\cite{sun2023rankgpt}, FIRST~\cite{reddy2024first} and jina-reranker-v3~\cite{wang2025jinav3} rerank by reading candidates jointly; PE-Rank~\cite{liu2025perank} compresses each passage to a single embedding token.
+LLMs are sensitive to candidate and option order~\cite{liu2024lost,zheng2024pride}, and recent work exploits this as an attack surface on listwise recommenders~\cite{bitoattack2026}.
+Set-Encoder~\cite{schlatt2025setencoder} achieves permutation invariance in a cross-encoder through inter-passage attention over \texttt{[INT]} tokens, and InvariRank~\cite{bito2026invarirank} blocks cross-candidate attention with shared RoPE positions for LLM recommendation reranking.
+\method{} uses the same isolation principle but adds per-tool caching across queries, nested compression, abstention and a conformal guarantee; InvariRank and Set-Encoder re-encode every candidate for every query.
+
+\paragraph{Reusable and position-independent KV caches.}
+Prefix caching only reuses an identical prefix.
+Parallel/position-independent encoding reuses chunks at arbitrary positions: Block-Attention~\cite{sun2025blockattention} fine-tunes a model to read independently encoded blocks; APE~\cite{yang2025ape} aligns parallel and sequential attention without training; EPIC~\cite{hu2025epic}, CacheBlend~\cite{yao2025cacheblend} and KVLink~\cite{yang2025kvlink} recompute or link a few tokens to repair cross-chunk attention.
+For agents, ContextCache~\cite{sarkar2026contextcache} and Nexus~\cite{arslan2026nexus} transplant compiled schema caches (Nexus reports RoPE drift away from an anchor position), and CacheRouter~\cite{zha2026cacherouter} keeps the main model's prefix stable by routing through a side model.
+Closest to us, ReCache~\cite{fang2026recache} caches each tool or skill schema with resource-wise attention and resource-local positions, and prunes visibility by layer and head; it matches dense attention in invocation F1 (82.3 vs.\ 82.4) with a 3.7$\times$ TTFT speed-up.
+ReCache keeps full (pruned) schemas, generates free-form invocations, and reports that a gist-compression baseline loses heavily (39.2 Inv-F1).
+\method{} differs in four ways: (a) a fixed request offset gives \emph{exact} rather than empirical order invariance; (b) per-tool caches are compressed to $g$ nested gists, and we close the gist gap with self-distillation from the uncompressed path and a fine pass over the top-$M$; (c) one cache supports a two-level decision; (d) the output is a calibrated pointer distribution with abstention.
+
+\paragraph{Context compression.}
+Gist tokens~\cite{mu2023gist}, AutoCompressor~\cite{chevalier2023autocompressor}, ICAE~\cite{ge2024icae}, Activation Beacon~\cite{zhang2024beacon} and 500xCompressor~\cite{li2024500x} compress long contexts into a few soft tokens or KV entries.
+A systematic study finds gist compression near-lossless for many tasks but weak at exact recall~\cite{deng2025giststudy}, and GistPool revisits the design for long contexts~\cite{petrov2025gistpool}.
+Matryoshka representation learning~\cite{kusupati2022matryoshka} trains nested prefixes of an embedding to be usable at any size; we transfer the idea to gist sequences, where the nesting comes for free from causal attention within a block.
+Late-interaction retrieval (ColBERT~\cite{khattab2020colbert}) keeps one vector per token; our late-interaction variant is an ablation.
+
+\paragraph{Spoken and visual requests.}
+Voice assistants classically route speech through ASR and a text intent classifier; end-to-end spoken language understanding removes the transcript, and Audio2Tool~\cite{audio2tool} evaluates tool calls from speech.
+GUI agents ground instructions to screen elements; OS-Atlas~\cite{wu2024osatlas} provides cross-platform grounding data.
+Omni models such as Gemma~4~\cite{gemma4} and Qwen3-Omni~\cite{qwen3omni} map audio and images into the language model's token space.
+We use that space directly: the request's soft tokens attend to a text tool cache that was built without them.
+
+\paragraph{Uncertainty, abstention and conformal prediction.}
+Split conformal prediction gives finite-sample coverage under exchangeability~\cite{angelopoulos2023gentle}; least-ambiguous sets (LAC)~\cite{sadinle2019lac} threshold the softmax score.
+KnowNo~\cite{ren2023knowno} uses conformal sets over an LLM's options to decide when a robot should ask for help; conformal abstention bounds hallucination~\cite{abbasi2024conformal}; recent work applies conformal risk control to tool calls by role~\cite{rolestratified2026}.
+Distance-aware heads (SNGP~\cite{liu2020sngp}), deep ensembles and energy scores~\cite{liu2020energy} are standard OOD signals and appear as head ablations.
+Because conformal coverage is a statement about scores, it is only meaningful for tool selection if the scores do not depend on presentation order; \method{} makes that true by construction.
+
+%=====================================================================
+\section{Method}\label{sec:method}
+%=====================================================================
+\subsection{Problem}
+A decision instance is a request $x$ (text, and in later work audio or an image), a catalog $C=\{t_1,\dots,t_N\}$ of tool descriptions, and the abstain option $\varnothing$.
+The model outputs $p(\cdot\mid x,C)$ over $C\cup\{\varnothing\}$ and an action $a\in\{\textsc{execute}(t),\textsc{ask}(S),\textsc{abstain}\}$.
+
+\subsection{Block-isolated tools}\label{sec:block}
+The input is a shared prefix $P$ (``Options:''), then one block per tool, then the request.
+Token $u$ in block $k$ may attend to $P$ and to earlier tokens of block $k$ only; positions inside block $k$ start at $|P|$ regardless of $k$ (catalog-independent positions).
+Request tokens take positions $R, R{+}1,\dots$ for a fixed offset $R$ (we use $R{=}640$, larger than any tool block), and attend to $P$, to earlier request tokens, and to the \emph{visible} tokens of every block (the gists, \S\ref{sec:gist}).
+The abstain option is a block like any other, so the model learns its representation.
+
+\subsection{Nested gists}\label{sec:gist}
+After each tool's text we append $g$ gist tokens $\gamma_1,\dots,\gamma_g$ with learned embeddings.
+Gists attend to their own tool text and to earlier gists of the same tool (causal order), so the KV state of $\gamma_j$ does not depend on $\gamma_{j'}$ for $j'>j$.
+The request sees only gists; a tool's cache is therefore its $g$ gist KV entries per layer.
+During training we sample a budget $b\in\mathcal{B}=\{1,2,4,8\}$ per step and let the request see only $\gamma_{1..b}$ of every tool, so each prefix is a usable summary.
+
+\paragraph{Gist self-distillation.} In the same step we run the request against the \emph{full} tool tokens (no compression) and add $\mathrm{KL}(p_\text{full}\,\|\,p_\text{gist})$ with the full path detached, so compression is trained to preserve the uncompressed decision.
+
+\subsection{Pointer head and training objective}
+The request's last hidden state $h_x$ and each tool's pooled visible state $h_k$ (mean or attention pool over its gists) are layer-normalised and projected; the score is $s_k=\langle W_q h_x, W_o h_k\rangle/\sqrt{d}$, and $p=\mathrm{softmax}(s)$ over $C\cup\{\varnothing\}$.
+The loss is listwise cross-entropy plus a Brier term, the distillation term above, and (when used) teacher soft labels from a larger LLM scored over option letters with rotation averaging.
+Ablations replace the dot head with a Gaussian head (with KL), an RBF head with spectral normalisation, a 3-member ensemble scored by energy, or late interaction (MaxSim over per-token states).
+
+\subsection{Two-level decisions from one cache}\label{sec:two}
+Coarse: the request attends to $\gamma_1$ of all $N$ tools ($N$ keys per layer) and we keep the top-$M$ by score.
+Fine: the request attends to all $g$ gists of those $M$ tools and the abstain block.
+Both passes read the same cache; only $\gamma_1$ must be resident for every tool, which supports memory tiering at 10k+ tools.
+
+\subsection{Spoken and screenshot requests}\label{sec:mm}
+On an omni backbone the request block may begin with media: the backbone's own frozen audio or vision tower and projector map a waveform or an image to $n$ soft tokens, which are placed after a short ``Input:'' prefix inside the request block, at positions $R, R{+}1, \dots$.
+Tool blocks are untouched, so a catalog cache built from text serves text, speech and image requests alike.
+Backbones with per-layer token embeddings (Gemma~4 E2B/E4B look each token up a second time for every layer) receive these per-layer inputs computed from clean token ids, with gist, slot and media positions mapped to padding, the same rule the backbone uses for media positions.
+For UI pointing the options are screen regions described only by position and size, never by their text, so the screenshot must decide.
+
+\subsection{Conformal decisions}\label{sec:conf}
+On a held-out calibration split we compute the LAC threshold $\hat q$ as the $\lceil (n{+}1)(1{-}\alpha)\rceil/n$ quantile of $1-p(y_i)$.
+The set is $S(x)=\{c: p(c\mid x,C)\ge 1-\hat q\}$; we \textsc{execute} if $S=\{t\}$, \textsc{abstain} if $S=\{\varnothing\}$ or empty, and \textsc{ask} otherwise (the agent shows $S$ to the user).
+We also report a normalised variant that conditions $\hat q$ on catalog size.
+
+%=====================================================================
+\section{Properties}\label{sec:props}
+%=====================================================================
+Let $K_k, V_k$ denote the gist keys and values of tool $k$ at a layer.
+
+\begin{proposition}[Composition]
+The KV states of block $k$ are a function of $(P, t_k)$ only. Hence caches computed for each tool separately and concatenated equal the caches of a joint pass over the catalog.
+\end{proposition}
+\begin{proof}[Sketch]
+By the mask, every token of block $k$ attends only to $P$ and to block $k$, and its positions are independent of $k$ and of $N$. Induction over layers.
+\end{proof}
+
+\begin{proposition}[Order equivariance]
+For any permutation $\pi$ of the catalog, $s_{\pi(k)}(x, \pi C) = s_k(x, C)$ and $s_\varnothing$ is unchanged.
+\end{proposition}
+\begin{proof}[Sketch]
+Request tokens have fixed positions $R,\dots$ and attend to the union of all visible gist keys, whose RoPE phases do not depend on catalog order. Softmax attention is a sum over keys, hence invariant to their order, so $h_x$ is invariant; $h_k$ depends on block $k$ only (Prop.~1). The head is applied per option.
+\end{proof}
+
+\begin{corollary}[Order-invariant conformal sets]
+$S(x)$, as a set of tool identities, is invariant to catalog order; the split-conformal coverage $\Pr[y\in S(x)]\ge 1-\alpha$ holds whatever order clients use, at calibration and at test time.
+\end{corollary}
+
+\begin{proposition}[Budget nesting]
+The cache for budget $b$ is the first $b$ gist entries of the cache for budget $g$; two-level scoring with $M{=}N$ and $b{=}g$ equals single-pass scoring.
+\end{proposition}
+
+\paragraph{Media requests.} Propositions 1--3 and the corollary make no assumption about the content of the request block, so they hold verbatim when it contains speech or image soft tokens.
+
+\paragraph{Numerical check (fp32, Qwen2.5-0.5B, untrained heads).} Reversing a 16-tool catalog changes probabilities by at most $1.6\times10^{-6}$ (block and gist layouts) versus $0.246$ for the query-first pointer layout. Composed per-tool caches match a joint pass to $1.2\times10^{-6}$ (gists) and $1.8\times10^{-7}$ (late interaction). Two-level scoring at full budget equals single-pass scoring exactly ($0.0$). Deviations are float summation order. With a speech request on a randomly initialised Gemma~4 with the real E2B layout (per-layer embeddings, sliding and global layers, audio and vision towers), order equivariance, composition and two-level nesting are exact in fp64 ($0.0$) and at $10^{-6}$ relative in fp32. \pending{Same check on pretrained Gemma~4 E2B, 4-bit, T4.}
+
+\paragraph{Complexity.} A pointer router prefills $L_q + N L_t$ tokens per request: $O((L_q+NL_t)d^2 + (L_q+NL_t)^2 d)$. \method{} prefills $L_q$ tokens and attends to $Nb$ cached keys: $O(L_q d^2 + L_q N b\, d)$, plus $O(L_q M g\, d)$ for the fine pass. On our data $L_q\approx38$ and a 6-tool menu is $\approx246$ tokens.
+
+%=====================================================================
+\section{Experimental Setup}\label{sec:exp}
+%=====================================================================
+\paragraph{Data.} (i) ToolRet~\cite{shi2025toolret}: queries with gold tools; candidates are the top-$K$ of a MiniLM first stage for $K\in\{16,64,256,1024\}$, with the gold tool inserted only when computing oracle-menu accuracy (reported separately). The \texttt{toolace} subset is excluded because it overlaps our training source. (ii) Soro packages: 6-tool menus with look-alike near-misses and abstain cases, split by package. (iii) Abstention: BFCL irrelevance~\cite{patil2025bfcl} and When2Call~\cite{ross2025when2call}. (iv) Spoken requests: held-out requests rendered with Kokoro TTS~\cite{kokoro} across voices with noise and speed augmentation; each is paired with its transcript, so the text-to-speech gap is measured on identical decisions, and text twins of spoken test requests are removed from training. (v) Screenshot pointing: OS-Atlas UI rows with region-only options and absent-element abstain cases. Audio2Tool is used for evaluation only (non-commercial licence).
+Training data is MinHash-deduplicated against all test sets and audited for leakage.
+
+\paragraph{Backbones.} Qwen3-0.6B-Base for all text results; Gemma~4 E2B (4-bit, LoRA, frozen media towers) for the scaling run and all speech and screenshot results. Hybrid linear-attention backbones (e.g.\ Gated DeltaNet layers) cannot express the block mask and are excluded.
+
+\paragraph{Baselines.} BM25; MiniLM; Qwen3-Embedding-0.6B~\cite{zhang2025qwen3emb}; Qwen3-Reranker-0.6B and jina-reranker-v3~\cite{wang2025jinav3} on the same candidates; a query-first pointer router with the same backbone and training data; Set-Encoder~\cite{schlatt2025setencoder}; PE-Rank~\cite{liu2025perank}; ReCache-style uncompressed per-tool caches (our block layout with full tool tokens visible, configuration ``F''); ToolGen and Tool-Rank as reported numbers where protocols match.
+
+\paragraph{Metrics.} Top-1 accuracy and nDCG@10; abstain AUROC and F1; conformal coverage, set size and execute rate at $\alpha\in\{0.05,0.1\}$; error-detection AUROC; latency per request and cache MB per tool. Three seeds; query-clustered bootstrap 95\% CIs.
+
+\paragraph{Hardware.} Training on 2$\times$ NVIDIA T4 (fp16 autocast, fp32 master weights). Latency on an RTX 4050 laptop GPU (bf16), a T4, and CPU.
+
+%=====================================================================
+\section{Results}
+%=====================================================================
+\subsection{Why read large catalogs}
+\begin{table}[t]
+\caption{Recall of a MiniLM first stage on ToolRet (400 queries). A reader limited to $K$ candidates cannot exceed this.}
+\label{tab:recall}
+\begin{tabular}{lrrrrr}
+\toprule
+$K$ & 1 & 16 & 64 & 256 & 1024\\
+\midrule
+Recall@$K$ (\%) & 17.0 & 47.7 & 67.5 & 83.3 & 91.0\\
+\bottomrule
+\end{tabular}
+\end{table}
+Table~\ref{tab:recall}: a reranker limited to 16 candidates caps end-to-end accuracy at 47.7\%; reading 1{,}024 lifts the ceiling to 91.0\%.
+
+\subsection{Efficiency}
+\begin{table}[t]
+\caption{Latency per request (ms, bf16, RTX 4050, 0.5B backbone, untrained heads). ``--'': out of memory (14.8k / 62k-token prompts).}
+\label{tab:latency}
+\begin{tabular}{lrrrrr}
+\toprule
+Tools & 6 & 16 & 64 & 256 & 1024\\
+\midrule
+Pointer router (query first) & 72 & 252 & 2204 & -- & --\\
+Catalog first, cached text & 56 & 65 & 86 & -- & --\\
+Gist $\times4$, composed caches & & & 102 & 86 & 204\\
+\method{} (nested $\times8$) & & & 87 & 76 & 110\\
+Two-level (1$\times N$ $\to$ 8$\times$16) & & & 524 & 164 & 361\\
+\bottomrule
+\end{tabular}
+\end{table}
+Table~\ref{tab:latency}. A tool's cache is 0.047\,MB ($g{=}4$, bf16; 48\,MB for 1{,}024 tools); late interaction needs 0.007\,MB.
+At $\le$1k tools a single pass is faster than two-level; two-level is for memory tiering at larger scale.
+\todo{Repeat on T4 and CPU with 50 repetitions; add cache build time per tool.}
+
+\subsection{Accuracy at scale}
+\begin{table}[t]
+\caption{ToolRet top-1 accuracy (\%) with MiniLM top-$K$ candidates. \pending{all cells}}
+\label{tab:acc}
+\begin{tabular}{lrrrr}
+\toprule
+$K$ & 16 & 64 & 256 & 1024\\
+\midrule
+MiniLM / Qwen3-Emb & \pending{} & & & \\
++ Qwen3-Reranker / jina-v3 & \pending{} & & & \\
+Pointer router & \pending{} & \pending{} & -- & --\\
+Full-text block (F) & \pending{} & \pending{} & -- & --\\
+\method{} single pass & \pending{} & & & \\
+\method{} two-level & \pending{} & & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Calibrated abstention}
+\pending{Abstain AUROC/F1 on BFCL irrelevance and When2Call; coverage, set size and execute rate at $\alpha=0.1$; order-shuffled coverage for the pointer router vs.\ \method{} (the corollary predicts no change for \method{}).}
+
+\subsection{Spoken and screenshot requests}
+\begin{table}[t]
+\caption{Gemma~4 E2B, one text tool cache, three request modalities. \pending{all cells}}
+\label{tab:mm}
+\begin{tabular}{lrrr}
+\toprule
+& Transcript & Speech & Screenshot (UI)\\
+\midrule
+Pointer router (A) & \pending{} & \pending{} & \pending{}\\
+\method{} (KM) & \pending{} & \pending{} & \pending{}\\
+\bottomrule
+\end{tabular}
+\end{table}
+\pending{Table~\ref{tab:mm}: top-1 accuracy, abstain F1 on absent-element rows, conformal coverage per modality; the speech minus transcript gap is the cost of skipping ASR.}
+
+\subsection{Ablations}
+\pending{Gists $g\in\{1,2,4,8\}$; nested vs.\ fixed budget; distillation on/off; head type (dot, Gaussian, RBF-SN, ensemble-energy, late); attention pooling; accuracy by budget from one nested cache.}
+
+%=====================================================================
+\section{Limitations}
+%=====================================================================
+Isolation removes cross-tool comparison during encoding; tools are compared only through the request.
+Gist compression may blur exact identifiers (a known weakness of gist tokens~\cite{deng2025giststudy}, and the main risk identified by ReCache's gist baseline~\cite{fang2026recache}); the fine pass and distillation are our mitigations, and Table~\ref{tab:acc} measures the residual gap.
+The block mask needs full softmax attention in every layer, which excludes hybrid linear-attention backbones and requires checking sliding-window models.
+Conformal coverage is marginal and assumes exchangeability between calibration and deployment requests; we calibrate per modality because speech and text score distributions differ.
+Spoken requests are synthetic (TTS); real recordings are evaluated only through Audio2Tool.
+
+\section{Conclusion}
+\method{} turns a catalog into a set of small, composable, order-free caches and reads them as a calibrated pointer.
+\todo{one-sentence headline result once Table~\ref{tab:acc} is filled.}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+\end{document}

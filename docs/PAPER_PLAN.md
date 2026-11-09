@@ -72,6 +72,13 @@ Small-menu timings are noisy on a laptop GPU; final numbers come from T4/A100 wi
 | E3 | Efficiency | latency and memory vs menu size (6 to 1024), cache MB per tool, build time | all |
 | E4 | Ablations | g ∈ {1,2,4,8}, nested vs fixed, distillation on/off, block vs Kev, head type | — |
 | E5 | Order robustness | reversed / shuffled menus | Kev, listwise rerankers |
+| E7 | Any request modality over one text cache | Gemma 4 E2B: Kokoro-TTS held-out requests (paired with transcripts), OS-Atlas UI rows (region-only options), Audio2Tool (eval only) | Kev-style pointer (A) on the same backbone; transcript accuracy as the upper reference |
+
+E7 code: `soro/routing/media.py` (frozen Gemma 4 audio/vision towers -> soft tokens in the request block),
+`veyra/training/media_check.py` (exactness with speech requests; tiny random Gemma 4: exactly 0.0 in fp64),
+`veyra/training/kaggle_omni_slice.ipynb` (runs after data pass 2). Fixed on the way: Gemma 4 E2B/E4B need
+per-layer inputs from token ids; UPP now passes them (gists, slots, media and padding read as pad), so the
+pass-1 Gemma A/J and parent-check runs, which predate the fix, must be rerun.
 
 Protocol: 3 seeds, query-clustered bootstrap CIs, fixed hardware (T4 and RTX 4050 for latency, plus CPU),
 leakage audit (`soro.omni_data.audit`), code + weights + caches released.
@@ -109,6 +116,11 @@ retrieve-then-rerank on ToolRet at 64+ tools, switch the lead claim to calibrati
 - Gist compression can blur look-alike tools (ACL 2025 gist study: weak on exact recall). Mitigations: larger
   fine budget, two-level design, distillation.
 - Reviewers will ask why not bi-encoder + cross-encoder cascade: E1/E3 must show the Pareto win.
+- **ReCache (arXiv 2608.19662, Aug 2026) is the closest prior work**: per-tool KV caches with resource-wise
+  attention and tool-local positions, 82.3 vs 82.4 dense Inv-F1, but full (pruned) schemas, generative output,
+  no abstain, empirical invariance only, and its gist baseline scored 39.2. Our claim is therefore compression
+  (nested gists) + two-level + exact invariance + conformal abstain; config F is the ReCache-style baseline.
+  Also cite InvariRank (SIGIR 2026), Nexus, CacheRouter, NTILC, Toollery. Draft: `paper/main.tex`.
 - Prior-art overlap (PE-Rank, ToolGen, Set-Encoder, Block-Attention, KVLink, gist tokens, KnowNo) must be
   cited and contrasted explicitly; our claim is the combination: exact composable per-tool caches + nested
   two-level decisions + calibrated abstain, in one model.

@@ -114,9 +114,13 @@ class SoroKevModel(nn.Module):
         torch_dtype: torch.dtype | None = None,
         allow_mock_fallback: bool = True,
         load_in_4bit: bool = False,
+        keep_media: bool = False,
     ):
         super().__init__()
         self.model_name = model_name
+        # keep_media: keep the audio/vision towers of an omni backbone (Gemma 4) for spoken
+        # and image requests; the language model is shared, not copied.
+        self.media_model = None
         self.hidden_size = hidden_size
         self.proj_dim = proj_dim
         self.use_mock = use_mock
@@ -170,6 +174,9 @@ class SoroKevModel(nn.Module):
                             load_in_4bit=True,
                             bnb_4bit_quant_type="nf4",
                             bnb_4bit_use_double_quant=True,
+                            # media towers stay in half precision (small, and 4-bit hurts them)
+                            llm_int8_skip_modules=(["audio_tower", "vision_tower", "embed_audio", "embed_vision"]
+                                                   if keep_media else None),
                             # Gemma activations overflow fp16; on GPUs without bf16 (T4) compute in fp32.
                             bnb_4bit_compute_dtype=(
                                 torch.bfloat16 if torch.cuda.is_bf16_supported()
@@ -200,7 +207,10 @@ class SoroKevModel(nn.Module):
                 use_4bit = bool(load_kw.get("quantization_config"))
                 # Qwen3.5 ships a vision tower this router never uses. Drop it
                 # even in 4-bit, or the T4 is full before the first step.
-                if hasattr(loaded, "language_model"):
+                if hasattr(loaded, "language_model") and keep_media:
+                    base = loaded.language_model
+                    self.media_model = loaded
+                elif hasattr(loaded, "language_model"):
                     base = loaded._modules.pop("language_model")
                     for name in list(getattr(loaded, "_modules", {})):
                         del loaded._modules[name]

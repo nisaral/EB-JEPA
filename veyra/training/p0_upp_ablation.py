@@ -23,6 +23,11 @@ Example (RTX 4050 6 GB):
   python veyra/training/p0_upp_ablation.py --configs A,B,C,D,E --train-rows 4000
 CPU smoke test:
   python veyra/training/p0_upp_ablation.py --smoke
+Spoken and screenshot requests (omni backbone, e.g. Gemma 4 E2B), rows from the omni data build:
+  python veyra/training/p0_upp_ablation.py --base-model google/gemma-4-E2B --load-in-4bit --media \
+      --media-rows runs/omni_data/audio/audio.jsonl,runs/omni_data/ui/ui.jsonl --media-root /kaggle/input
+  Adds eval splits ``speech`` (TTS requests), ``speech_text`` (the same rows as their transcript:
+  the text-vs-speech gap), ``ui`` (screenshot pointing) and mixes the train-split media rows into training.
 """
 
 from __future__ import annotations
@@ -191,14 +196,14 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
         if use_cuda:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        probs, info = model.score(r["state"], crit)
+        probs, info = model.score(r["state"], crit, media=r.get("media"))
         if use_cuda:
             torch.cuda.synchronize()
         lat.append((time.perf_counter() - t0) * 1000)
         top = max(probs, key=probs.get)
         if len(crit) <= 64:  # order invariance is exact for block layouts; skip the costly check on huge menus
             rev = dict(reversed(list(crit.items())))
-            probs_rev, _ = model.score(r["state"], rev)
+            probs_rev, _ = model.score(r["state"], rev, media=r.get("media"))
             flips += int(top != max(probs_rev, key=probs_rev.get))
         g = gold_key(r, probs)
         ok = is_correct(r, top)
@@ -256,7 +261,7 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
         for b in model.cfg.gist_budgets:
             hit_b = 0
             for r in rows:
-                pb, _ = model.score(r["state"], r["questions"]["tool_route"]["criteria"], budget=b)
+                pb, _ = model.score(r["state"], r["questions"]["tool_route"]["criteria"], budget=b, media=r.get("media"))
                 hit_b += int(is_correct(r, max(pb, key=pb.get)))
             out["acc_by_budget"][b] = hit_b / n
         if not model.is_mock and len(rows[0]["questions"]["tool_route"]["criteria"]) > 24:
@@ -266,7 +271,7 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
                 if use_cuda:
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                p2, _ = model.score_two_level(r["state"], cat, coarse=1, top_m=16, fine=model.cfg.gists)
+                p2, _ = model.score_two_level(r["state"], cat, coarse=1, top_m=16, fine=model.cfg.gists, media=r.get("media"))
                 if use_cuda:
                     torch.cuda.synchronize()
                 lat2.append((time.perf_counter() - t0) * 1000)
@@ -280,7 +285,7 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
             if use_cuda:
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
-            model.score_cached(r["state"], cache)
+            model.score_cached(r["state"], cache, media=r.get("media"))
             if use_cuda:
                 torch.cuda.synchronize()
             cached.append((time.perf_counter() - t0) * 1000)
@@ -289,8 +294,8 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
         agree = 0
         for r in rows[:timing_rows]:
             crit = r["questions"]["tool_route"]["criteria"]
-            a, _ = model.score(r["state"], crit)
-            b, _ = model.score_cached(r["state"], model.encode_catalog(crit))
+            a, _ = model.score(r["state"], crit, media=r.get("media"))
+            b, _ = model.score_cached(r["state"], model.encode_catalog(crit), media=r.get("media"))
             agree += int(max(a, key=a.get) == max(b, key=b.get))
         out["cache_agreement"] = agree / min(timing_rows, n)
     print(f"  [{name}] acc {out['acc']:.3f} nll {out['nll']:.3f} ece {out['ece']:.3f} flips {out['flip_rate']:.3f} "
@@ -310,7 +315,7 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
     # master weights and run the forward under fp16 autocast with a GradScaler.
     dtype = None if (four_bit or bf16_ok or device == "cpu") else torch.float32
     model = UPPModel(cfg, model_name=args.base_model, use_mock=args.smoke,
-                     load_in_4bit=four_bit, torch_dtype=dtype)
+                     load_in_4bit=four_bit, torch_dtype=dtype, media=bool(getattr(args, "media", False)))
     if dtype is torch.float32 and not model.is_mock:
         model.backbone.float()
     if not model.is_mock and hasattr(model.backbone, "enable_input_require_grads"):
@@ -422,6 +427,65 @@ def markdown(results: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _media_path(path: str, root: Path | None, index: dict[str, Path]) -> str | None:
+    """Rows store paths relative to the run that made them; find the file wherever it is now."""
+    cand = Path(path)
+    if cand.exists():
+        return str(cand)
+    if root is not None and (root / path).exists():
+        return str(root / path)
+    hit = index.get(cand.name)
+    return str(hit) if hit else None
+
+
+def load_media_rows(paths: str, root: str | None, seed: int = 0) -> tuple[list, dict[str, list]]:
+    """Omni rows (soro.omni_data schema) with audio or an image -> P0 records.
+
+    Returns (train records, eval splits). Eval rows are the build's held-out splits (group-disjoint)."""
+    rootp = Path(root) if root else None
+    index: dict[str, Path] = {}
+    if rootp is not None and rootp.exists():
+        for f in rootp.rglob("*"):
+            if f.suffix.lower() in (".wav", ".flac", ".mp3", ".png", ".jpg", ".jpeg", ".webp"):
+                index.setdefault(f.name, f)
+    train, speech, speech_text, ui = [], [], [], []
+    missing = 0
+    for path in [x for x in paths.split(",") if x.strip()]:
+        for r in read_jsonl(Path(path.strip())):
+            kind = "audio" if r.get("audio") else ("image" if r.get("image") else None)
+            if kind is None:
+                continue
+            if "derived" in r.get("tags", []) and r.get("meta", {}).get("prefix_fraction"):
+                continue  # streaming prefixes are a separate experiment
+            fp = _media_path(r[kind], rootp, index)
+            if fp is None:
+                missing += 1
+                continue
+            crit = {o["key"]: o["text"] for o in r["options"]}
+            if r.get("label") not in crit:
+                continue
+            ctx = f"Context: {r['context']}\n" if r.get("context") else ""
+            text = r.get("text") or ""
+            state = ctx + (f"User Request: {text}" if text else "User Request: (spoken request in the input)"
+                           if kind == "audio" else "User Request: (see the screenshot)")
+            rec = {"id": r["id"], "state": state, "media": {kind: fp}, "source": r.get("source"),
+                   "questions": {"tool_route": {"criteria": crit, "label": r["label"]}}}
+            if r.get("split", "train") == "train":
+                train.append(rec)
+            elif kind == "audio":
+                speech.append(rec)
+                if r.get("transcript"):
+                    speech_text.append(dict(rec, state=ctx + f"User Request: {r['transcript']}", media=None))
+            else:
+                ui.append(rec)
+    rng = random.Random(seed)
+    for xs in (train, speech, ui):
+        rng.shuffle(xs)
+    print(f"media rows: train {len(train)} | speech {len(speech)} | speech_text {len(speech_text)} | ui {len(ui)} "
+          f"| missing files {missing}", flush=True)
+    return train, {"speech": speech, "speech_text": speech_text, "ui": ui}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--configs", default="A,B,C,D,E")
@@ -442,6 +506,10 @@ def main() -> None:
     ap.add_argument("--load-in-4bit", action="store_true")
     ap.add_argument("--no-grad-ckpt", action="store_true", help="Disable gradient checkpointing (faster, more VRAM)")
     ap.add_argument("--smoke", action="store_true", help="Tiny CPU run with a mock backbone")
+    ap.add_argument("--media", action="store_true", help="Keep the omni backbone's audio/vision towers")
+    ap.add_argument("--media-rows", default="", help="Comma-separated omni jsonl files with audio/image rows")
+    ap.add_argument("--media-root", default=None, help="Where the rows' wav/png files live now (searched by name)")
+    ap.add_argument("--media-train", type=int, default=2000, help="Media rows mixed into training (0 = eval only)")
     args = ap.parse_args()
 
     data_dir = resolve_data_dir(args.data_dir)
@@ -471,8 +539,26 @@ def main() -> None:
                   f"train overlap={st['train_query_overlap']}", flush=True)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    media_train: list[dict[str, Any]] = []
+    if args.media_rows and not args.smoke:
+        media_train, media_evals = load_media_rows(args.media_rows, args.media_root, seed=args.seed)
+        for name, rows_m in media_evals.items():
+            evals[name] = rows_m[: args.eval_rows]
+        if evals.get("speech_text"):  # keep the paired text rows aligned with the speech rows kept
+            keep = {r["id"] for r in evals.get("speech", [])}
+            evals["speech_text"] = [r for r in media_evals["speech_text"] if r["id"] in keep]
     evals = {k: v for k, v in evals.items() if v}
     train_rows = train_all[: args.train_rows]
+    if evals.get("speech_text"):
+        # the spoken eval requests are TTS of text requests; drop their text twins from training
+        said = {r["state"].split("User Request: ", 1)[-1].strip().lower() for r in evals["speech_text"]}
+        said = {t for t in said if len(t) > 8}
+        before = len(train_rows)
+        train_rows = [r for r in train_rows if not any(t in r["state"].lower() for t in said)]
+        print(f"dropped {before - len(train_rows)} train rows that repeat a spoken eval request", flush=True)
+    if media_train and args.media_train:
+        train_rows = train_rows + media_train[: args.media_train]
+        random.Random(args.seed).shuffle(train_rows)
     if args.smoke:
         args.base_model = "mock"
         train_rows = train_rows[:16]

@@ -159,3 +159,49 @@ def test_matryoshka_budget_masks_later_gists_and_trains():
     assert m.gist_emb.grad is not None
     p1, _ = m.eval().score(REC["state"], REC["questions"]["tool_route"]["criteria"], budget=1)
     assert abs(sum(p1.values()) - 1) < 1e-5
+
+
+def _media(model: UPPModel, n: int = 5, seed: int = 0) -> dict:
+    """A pre-encoded spoken/image request: soft tokens wrapped by two ordinary ids."""
+    g = torch.Generator().manual_seed(seed)
+    d = model._embed_layer().weight.shape[1]
+    return {"tokens": [7] + [UPPModel.MEDIA] * n + [8], "embeds": torch.randn(n, d, generator=g)}
+
+
+def test_media_request_is_placed_in_request_block_and_stays_order_invariant():
+    torch.manual_seed(0)
+    m = UPPModel(UPPConfig(layout="block", gists=2), use_mock=True).eval()
+    crit = REC["questions"]["tool_route"]["criteria"]
+    media = _media(m)
+    pk = m.build("", crit, media=media)
+    slots = [j for j, i in enumerate(pk["ids"]) if i == UPPModel.MEDIA]
+    assert len(slots) == 5 and all(pk["blocks"][j] == -2 for j in slots)  # inside the request block
+    assert min(pk["positions"][j] for j in slots) >= m.cfg.request_offset
+    a, _ = m.score("", crit, media=media)
+    b, _ = m.score("", dict(reversed(list(crit.items()))), media=media)
+    assert max(abs(a[k] - b[k]) for k in a) < 1e-5
+    c, _ = m.score("", crit, media=_media(m, seed=1))  # the media content reaches the decision
+    assert max(abs(a[k] - c[k]) for k in a) > 1e-6
+
+
+def test_media_rows_train_and_marker_ids_read_as_padding():
+    m = UPPModel(UPPConfig(layout="block", gists=2), use_mock=True)
+    rec = dict(REC, state="", media=_media(m))
+    out = m.forward_batch([rec, REC])
+    assert not out["skipped"] and out["kept"] == 2
+    out["loss"].backward()
+    pk = m.build("", REC["questions"]["tool_route"]["criteria"], media=rec["media"])
+    _, _, _, ids = m._batch([pk], torch.device("cpu"), m._mode())
+    assert int(ids.min()) >= 0  # gists and media never reach a per-layer lookup as negative ids
+    assert all(ids[0, j].item() == m._pad_id() for j, i in enumerate(pk["ids"]) if i < 0)
+
+
+def test_media_slot_count_must_match_embeddings():
+    import pytest
+
+    m = UPPModel(UPPConfig(layout="block"), use_mock=True)
+    bad = dict(_media(m), embeds=torch.zeros(3, m._embed_layer().weight.shape[1]))
+    with pytest.raises(ValueError):
+        m.score("", {"a": "tool a", "__abstain__": "none"}, media=bad)
+    with pytest.raises(ValueError):  # raw paths need media=True
+        m.score("", {"a": "tool a", "__abstain__": "none"}, media={"audio": "x.wav"})

@@ -38,6 +38,10 @@ Option compression and interaction (block layout)
                       then serves a coarse pass over the whole catalog (1 gist per tool) and a
                       fine pass over the top-M tools (all gists): retrieval and listwise
                       reranking in one model (``score_two_level``).
+Request modality (``media=True``, omni backbones such as Gemma 4)
+  * The catalog stays text and is cached once; the request may carry speech or an image,
+    entered as the backbone's own soft tokens (``soro.routing.media``) inside the request
+    block. All block-layout exactness properties hold for these requests too.
 
 Every head also reports an energy score (logsumexp of logits) and a scalar
 uncertainty ``u`` used for normalized conformal sets.
@@ -244,6 +248,7 @@ class UPPModel(nn.Module):
         use_mock: bool = False,
         load_in_4bit: bool = False,
         torch_dtype: torch.dtype | None = None,
+        media: bool = False,
     ):
         super().__init__()
         if cfg.interaction == "late" and cfg.layout != "block":
@@ -257,8 +262,17 @@ class UPPModel(nn.Module):
             allow_mock_fallback=use_mock,
             load_in_4bit=load_in_4bit,
             torch_dtype=torch_dtype,
+            keep_media=media and not use_mock,
         )
         self.model_name = model_name
+        self.media_encoder = None
+        if media and not use_mock:
+            if base.media_model is None:
+                raise ValueError(f"media=True needs an omni backbone with audio/vision towers; {model_name} has none")
+            from soro.routing.media import MediaEncoder
+
+            self.media_encoder = MediaEncoder(base.media_model, model_name)
+        self._media_device = None
         self.backbone = base.backbone
         self.tokenizer = base.tokenizer
         self._mock_tok = base._tokenize_text
@@ -267,7 +281,9 @@ class UPPModel(nn.Module):
         self.head = LateHead(d_model, cfg) if cfg.interaction == "late" else UPPHead(d_model, cfg)
         self.pool = AttnPool(d_model) if cfg.option_pool == "attn" else None
         emb = self._embed_layer().weight
-        mean_emb = emb.detach().float().mean(0, keepdim=True)
+        # learned tokens start at the embedding layer's real scale (Gemma multiplies by sqrt(d))
+        scale = float(getattr(self._embed_layer(), "embed_scale", 1.0) or 1.0)
+        mean_emb = emb.detach().float().mean(0, keepdim=True) * scale
         self.slots = None
         if cfg.think_slots > 0:
             self.slots = nn.Parameter(mean_emb.repeat(cfg.think_slots, 1)
@@ -300,6 +316,44 @@ class UPPModel(nn.Module):
             return self.backbone.embedding
         return self.backbone.get_input_embeddings()
 
+    MEDIA = -3  # request positions filled with media soft tokens
+
+    def _pad_id(self) -> int:
+        tok = self.tokenizer
+        pid = getattr(tok, "pad_token_id", None) if tok is not None else None
+        return int(pid) if pid is not None else 0
+
+    def _ple_model(self) -> Any:
+        """The text model when it uses per-layer embeddings (Gemma 4 E2B/E4B), else None.
+
+        Those models look token ids up a second time for every layer. Given only embeddings
+        they try to invert the embedding table, which fails for gists, think slots, media and
+        padding; so UPP computes the per-layer inputs from clean token ids itself."""
+        if self.is_mock:
+            return None
+        m = self.backbone.get_base_model() if hasattr(self.backbone, "get_base_model") else self.backbone
+        if getattr(m, "hidden_size_per_layer_input", None) and hasattr(m, "get_per_layer_inputs"):
+            return m
+        return None
+
+    def _clean_ids(self, ids: list[int]) -> list[int]:
+        """Token ids for per-layer lookups: markers (slots, gists, media) read as padding."""
+        pad = self._pad_id()
+        return [i if i >= 0 else pad for i in ids]
+
+    def _resolve_media(self, media: Any) -> dict[str, Any] | None:
+        if not media:
+            return None
+        if isinstance(media, dict) and "embeds" in media:
+            return media
+        if self.media_encoder is None:
+            raise ValueError("this UPPModel was built without media=True")
+        dev = self._device
+        if self._media_device != dev:
+            self.media_encoder.to(dev)
+            self._media_device = dev
+        return self.media_encoder.encode(media)
+
     def _tok(self, text: str, special: bool = False) -> list[int]:
         if self.tokenizer is not None:
             return self.tokenizer.encode(text, add_special_tokens=special)
@@ -311,8 +365,8 @@ class UPPModel(nn.Module):
         n = int(getattr(getattr(self.backbone, "config", None), "num_hidden_layers", 0) or 0)
         return sorted({max(1, min(n - 1, round(f * n))) for f in self.cfg.exits}) if n else []
 
-    def _hidden(self, embeds, mask, positions=None, past=None, use_cache=False):
-        """Returns (last hidden, list of exit hiddens, past)."""
+    def _hidden(self, embeds, mask, positions=None, past=None, use_cache=False, ids=None):
+        """Returns (last hidden, list of exit hiddens, past). ``ids``: (B, L) clean token ids."""
         if self.is_mock:
             b = self.backbone
             L = embeds.shape[1]
@@ -326,9 +380,15 @@ class UPPModel(nn.Module):
                 h = b.transformer(x, mask=causal, src_key_padding_mask=(mask == 0), is_causal=True)
             return b.proj(h), [], None
         exits = self._exit_layers()
+        extra: dict[str, Any] = {}
+        ple = self._ple_model()
+        if ple is not None:
+            if ids is None:
+                raise ValueError("per-layer-embedding backbones need token ids alongside embeddings")
+            extra["per_layer_inputs"] = ple.get_per_layer_inputs(ids.to(embeds.device), None)
         out = self.backbone(
             inputs_embeds=embeds, attention_mask=mask, position_ids=positions, past_key_values=past,
-            use_cache=use_cache, output_hidden_states=bool(exits),
+            use_cache=use_cache, output_hidden_states=bool(exits), **extra,
         )
         h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
         hs = [out.hidden_states[i] for i in exits] if exits else []
@@ -342,11 +402,15 @@ class UPPModel(nn.Module):
         toks = self._tok(body)
         return toks[:budget] if budget is not None else toks
 
-    def _request_tokens(self, state: str) -> list[int]:
-        question = f"Question [tool_route]: {ROUTE_INSTRUCTIONS}\n"
-        return self._tok(f"State: {state}\n") + self._tok(question) + [-1] * self.cfg.think_slots + self._tok("Answer:")
+    def _media_tokens(self, media: dict[str, Any] | None) -> list[int]:
+        return (self._tok("Input: ") + list(media["tokens"]) + self._tok("\n")) if media else []
 
-    def build(self, state: str, criteria: dict[str, str]) -> dict[str, Any]:
+    def _request_tokens(self, state: str, media: dict[str, Any] | None = None) -> list[int]:
+        question = f"Question [tool_route]: {ROUTE_INSTRUCTIONS}\n"
+        return (self._media_tokens(media) + self._tok(f"State: {state}\n") + self._tok(question)
+                + [-1] * self.cfg.think_slots + self._tok("Answer:"))
+
+    def build(self, state: str, criteria: dict[str, str], media: dict[str, Any] | None = None) -> dict[str, Any]:
         """Token ids (markers: -1 slot, -100-j gist j), positions, blocks and readout indices."""
         cfg = self.cfg
         keys = list(criteria)
@@ -376,7 +440,7 @@ class UPPModel(nn.Module):
                 opt_tokens.append(list(range(start, start + len(toks))))
                 opt_gists.append(list(range(start + len(toks), start + n_all)))
             catalog_len = len(ids)
-            request = self._request_tokens(state)
+            request = self._request_tokens(state, media)
             r_start = len(ids)
             ids += request
             positions += list(range(cfg.request_offset, cfg.request_offset + len(request)))
@@ -392,12 +456,16 @@ class UPPModel(nn.Module):
                 opt_tokens.append(list(range(start, len(ids))))
             catalog_len = len(ids)
             r_start = len(ids)
-            ids += self._request_tokens(state)
+            ids += self._request_tokens(state, media)
             req_idx = list(range(r_start, len(ids)))
             positions = list(range(len(ids)))
             q_idx = len(ids) - 1
         else:
-            ids += self._tok(f"State: {state}\n", special=True) + self._tok(question)
+            if media:
+                ids += self._tok("", special=True) + self._media_tokens(media) + self._tok(f"State: {state}\n")
+            else:
+                ids += self._tok(f"State: {state}\n", special=True)
+            ids += self._tok(question)
             ids += [-1] * cfg.think_slots
             ids += self._tok("Options:\n")
             q_idx = len(ids) - 1
@@ -416,7 +484,8 @@ class UPPModel(nn.Module):
             opt_idx = opt_tokens
         return {"ids": ids, "positions": positions, "blocks": blocks or None, "is_gist": is_gist or None,
                 "q_idx": q_idx, "req_idx": req_idx, "opt_idx": opt_idx, "opt_tokens": opt_tokens,
-                "opt_gists": opt_gists, "keys": keys, "catalog_len": catalog_len}
+                "opt_gists": opt_gists, "keys": keys, "catalog_len": catalog_len,
+                "media": media["embeds"] if media else None}
 
     def _block_allowed(self, pk: dict[str, Any], L: int, mode: str) -> torch.Tensor:
         """(L, L) bool. mode: gist (request sees gists), full (request sees option tokens), none (late)."""
@@ -462,11 +531,18 @@ class UPPModel(nn.Module):
             return "full"
         return "gist" if self.cfg.gists else "full"
 
-    def _embed(self, ids: list[int], device: torch.device) -> torch.Tensor:
+    def _embed(self, ids: list[int], device: torch.device, media: torch.Tensor | None = None) -> torch.Tensor:
         emb = self._embed_layer()
         x = emb(torch.tensor([max(i, 0) for i in ids], dtype=torch.long, device=device))
         slot_pos = [j for j, i in enumerate(ids) if i == -1]
         gist_pos = [(j, self.GIST_BASE - i) for j, i in enumerate(ids) if i <= self.GIST_BASE]
+        media_pos = [j for j, i in enumerate(ids) if i == self.MEDIA]
+        if media_pos:
+            if media is None or media.shape[0] != len(media_pos):
+                got = None if media is None else tuple(media.shape)
+                raise ValueError(f"{len(media_pos)} media slots but media embeddings {got}")
+            x = x.clone()
+            x[media_pos] = media.to(device=x.device, dtype=x.dtype)
         if slot_pos or gist_pos:
             x = x.clone()
             if slot_pos and self.slots is not None:
@@ -481,6 +557,7 @@ class UPPModel(nn.Module):
         dtype = self._embed_layer().weight.dtype
         embeds = torch.zeros(len(packs), L, emb_dim, device=device, dtype=dtype)
         positions = torch.zeros(len(packs), L, dtype=torch.long, device=device)
+        tok_ids = torch.full((len(packs), L), self._pad_id(), dtype=torch.long, device=device)
         block = self.cfg.layout == "block"
         if block:
             neg = torch.finfo(dtype if dtype.is_floating_point else torch.float32).min
@@ -489,7 +566,8 @@ class UPPModel(nn.Module):
             mask = torch.zeros(len(packs), L, dtype=torch.long, device=device)
         for b, pk in enumerate(packs):
             n = len(pk["ids"])
-            embeds[b, :n] = self._embed(pk["ids"], device)
+            embeds[b, :n] = self._embed(pk["ids"], device, pk.get("media"))
+            tok_ids[b, :n] = torch.tensor(self._clean_ids(pk["ids"]), device=device)
             positions[b, :n] = torch.tensor(pk["positions"], device=device)
             if n < L:
                 positions[b, n:] = positions[b, n - 1] + 1
@@ -497,7 +575,7 @@ class UPPModel(nn.Module):
                 mask[b, 0][self._block_allowed(pk, L, mode).to(device)] = 0.0
             else:
                 mask[b, :n] = 1
-        return embeds, mask, positions
+        return embeds, mask, positions, tok_ids
 
     # ------------------------------------------------------------------ readout
     def _pool(self, h: torch.Tensor) -> torch.Tensor:
@@ -523,7 +601,7 @@ class UPPModel(nn.Module):
         packs, golds = [], []
         for r in records:
             q = r["questions"]["tool_route"]
-            pk = self.build(r["state"], q["criteria"])
+            pk = self.build(r["state"], q["criteria"], media=self._resolve_media(r.get("media")))
             if len(pk["ids"]) > max_seq_len:
                 continue
             packs.append(pk)
@@ -534,14 +612,14 @@ class UPPModel(nn.Module):
         if self.cfg.gist_budgets and self.training:
             b = self.cfg.gist_budgets[int(torch.randint(len(self.cfg.gist_budgets), (1,)))]
             packs = [self._with_budget(pk, b) for pk in packs]
-        embeds, mask, positions = self._batch(packs, device, self._mode())
-        h, exit_hs, _ = self._hidden(embeds, mask, positions)
+        embeds, mask, positions, tok_ids = self._batch(packs, device, self._mode())
+        h, exit_hs, _ = self._hidden(embeds, mask, positions, ids=tok_ids)
         teacher_logits = None
         if self.cfg.gist_distill > 0 and self.cfg.gists and self.cfg.interaction == "cross":
             # Same model, request reading the full option text: the gist path learns to match it.
             with torch.no_grad():
-                t_embeds, t_mask, t_pos = self._batch(packs, device, self._mode(teacher=True))
-                th, _, _ = self._hidden(t_embeds, t_mask, t_pos)
+                t_embeds, t_mask, t_pos, t_ids = self._batch(packs, device, self._mode(teacher=True))
+                th, _, _ = self._hidden(t_embeds, t_mask, t_pos, ids=t_ids)
                 teacher_logits = [self._score(th[b], pk, [[t[-1]] for t in pk["opt_tokens"]])[0].detach()
                                   for b, pk in enumerate(packs)]
         losses, logits_out, us = [], [], []
@@ -578,14 +656,14 @@ class UPPModel(nn.Module):
 
     @torch.no_grad()
     def score(self, state: str, criteria: dict[str, str], budget: int | None = None,
-              ) -> tuple[dict[str, float], dict[str, Any]]:
+              media: Any = None) -> tuple[dict[str, float], dict[str, Any]]:
         """Probabilities over ``criteria`` for one request, plus uncertainty and exit info.
 
         ``budget`` limits how many gists per option the request reads (Matryoshka models)."""
         device = self._device
-        pk = self._with_budget(self.build(state, criteria), budget)
-        embeds, mask, positions = self._batch([pk], device, self._mode())
-        h, exit_hs, _ = self._hidden(embeds, mask, positions)
+        pk = self._with_budget(self.build(state, criteria, media=self._resolve_media(media)), budget)
+        embeds, mask, positions, tok_ids = self._batch([pk], device, self._mode())
+        h, exit_hs, _ = self._hidden(embeds, mask, positions, ids=tok_ids)
         logits, aux = self._score(h[0], pk)
         p = F.softmax(logits, -1).float().cpu().tolist()
         info: dict[str, Any] = {"u": float(aux["u"]), "energy": float(aux["energy"])}
@@ -627,8 +705,8 @@ class UPPModel(nn.Module):
         cat = dict(pk, ids=pk["ids"][:n], positions=pk["positions"][:n],
                    blocks=pk["blocks"][:n] if pk["blocks"] else None,
                    is_gist=pk["is_gist"][:n] if pk["is_gist"] else None)
-        embeds, mask, positions = self._batch([cat], device, self._mode())
-        h, _, past = self._hidden(embeds, mask, positions, use_cache=True)
+        embeds, mask, positions, tok_ids = self._batch([cat], device, self._mode())
+        h, _, past = self._hidden(embeds, mask, positions, use_cache=True, ids=tok_ids)
         opt_states = [h[0, ix].clone() for ix in pk["opt_idx"]]
         prefix_len = self._prefix_len(pk) if pk["blocks"] else 0
         if self.cfg.interaction == "late":
@@ -641,19 +719,22 @@ class UPPModel(nn.Module):
                 "cached_tokens": past.get_seq_length() if past is not None else 0}
 
     @torch.no_grad()
-    def _score_request(self, state: str, cat: dict[str, Any], fresh: bool = False,
+    def _score_request(self, state: str, cat: dict[str, Any], fresh: bool = False, media: Any = None,
                        ) -> tuple[dict[str, float], dict[str, Any]]:
         """Run only the request against a prepared catalog (cached KV or late-interaction vectors).
 
         The cache is not copied: the request's keys/values are appended and then cropped away,
         so the catalog cache is unchanged afterwards. ``fresh`` marks a throwaway sub-cache."""
         device = self._device
-        request = self._request_tokens(state)
-        x = self._embed(request, device).unsqueeze(0)
+        m = self._resolve_media(media)
+        request = self._request_tokens(state, m)
+        x = self._embed(request, device, m["embeds"] if m else None).unsqueeze(0)
+        req_ids = torch.tensor([self._clean_ids(request)], dtype=torch.long, device=device)
         start = self.cfg.request_offset if self.cfg.layout == "block" else cat["catalog_len"]
         pos = torch.arange(start, start + len(request), device=device).unsqueeze(0)
         if self.cfg.interaction == "late":
-            h, _, _ = self._hidden(x, torch.ones(1, len(request), dtype=torch.long, device=device), pos)
+            h, _, _ = self._hidden(x, torch.ones(1, len(request), dtype=torch.long, device=device), pos,
+                                   ids=req_ids)
             g = max(s.shape[0] for s in cat["opt_states"])
             gist = torch.stack([torch.cat([s, s[-1:].expand(g - s.shape[0], -1)]) for s in cat["opt_states"]])
             logits, aux = self.head(h[0], gist)
@@ -661,17 +742,22 @@ class UPPModel(nn.Module):
             mask = torch.ones(1, cat["cached_tokens"] + len(request), dtype=torch.long, device=device)
             past = cat["past"]
             try:
-                h, _, _ = self._hidden(x, mask, pos, past=past, use_cache=True)
+                h, _, _ = self._hidden(x, mask, pos, past=past, use_cache=True, ids=req_ids)
             finally:
                 if not fresh:
-                    past.crop(cat["cached_tokens"])  # drop the request's entries; catalog cache unchanged
+                    # drop the request's entries; catalog cache unchanged (negative crop = remove that
+                    # many tokens; positive crop is deprecated in transformers >= 5.18)
+                    extra_tokens = past.get_seq_length() - cat["cached_tokens"]
+                    if extra_tokens > 0:
+                        past.crop(-extra_tokens)
             opts = torch.stack([self._pool(s) for s in cat["opt_states"]])
             logits, aux = self.head(h[0, -1], opts)
         p = F.softmax(logits, -1).float().cpu().tolist()
         return {k: p[i] for i, k in enumerate(cat["keys"])}, {"u": float(aux["u"])}
 
-    def score_cached(self, state: str, cache: dict[str, Any]) -> tuple[dict[str, float], dict[str, Any]]:
-        return self._score_request(state, cache)
+    def score_cached(self, state: str, cache: dict[str, Any], media: Any = None,
+                     ) -> tuple[dict[str, float], dict[str, Any]]:
+        return self._score_request(state, cache, media=media)
 
     # ------------------------------------------------------------------ per-tool composable cache
     @torch.no_grad()
@@ -698,8 +784,9 @@ class UPPModel(nn.Module):
                 "catalog_len": None, "prefix_len": tools[0]["prefix_len"],
                 "cached_tokens": past.get_seq_length() if past is not None else 0}
 
-    def score_composed(self, state: str, catalog: dict[str, Any]) -> tuple[dict[str, float], dict[str, Any]]:
-        return self._score_request(state, catalog)
+    def score_composed(self, state: str, catalog: dict[str, Any], media: Any = None,
+                       ) -> tuple[dict[str, float], dict[str, Any]]:
+        return self._score_request(state, catalog, media=media)
 
     def _sub_catalog(self, cat: dict[str, Any], tool_ids: list[int], budget: int) -> dict[str, Any]:
         """View of a gist catalog with only ``tool_ids`` and their first ``budget`` gists."""
@@ -711,7 +798,7 @@ class UPPModel(nn.Module):
                 "prefix_len": pl, "cached_tokens": len(keep) if past is not None else 0}
 
     def score_two_level(self, state: str, cat: dict[str, Any], coarse: int = 1, top_m: int = 16,
-                        fine: int | None = None) -> tuple[dict[str, float], dict[str, Any]]:
+                        fine: int | None = None, media: Any = None) -> tuple[dict[str, float], dict[str, Any]]:
         """Coarse pass over every tool with ``coarse`` gists, then a fine pass over the top-M with
         ``fine`` gists, both read from the same cache. ``__abstain__`` always reaches the fine pass.
         With coarse = fine = gists and top_m >= catalog size this equals ``score_cached``."""
@@ -719,10 +806,12 @@ class UPPModel(nn.Module):
             raise ValueError("two-level scoring needs a cross-interaction gist model")
         fine = fine or self.cfg.gists
         n = len(cat["keys"])
+        media = self._resolve_media(media)  # encode once for both passes
         if coarse >= self.cfg.gists:
-            p_coarse, _ = self._score_request(state, cat)
+            p_coarse, _ = self._score_request(state, cat, media=media)
         else:
-            p_coarse, _ = self._score_request(state, self._sub_catalog(cat, list(range(n)), coarse), fresh=True)
+            p_coarse, _ = self._score_request(state, self._sub_catalog(cat, list(range(n)), coarse), fresh=True,
+                                              media=media)
         order = sorted(range(n), key=lambda i: -p_coarse[cat["keys"][i]])
         top = order[:top_m]
         if "__abstain__" in cat["keys"]:
@@ -730,7 +819,7 @@ class UPPModel(nn.Module):
             if ab not in top:
                 top = top[: max(0, top_m - 1)] + [ab]
         top = sorted(top)  # menu order does not matter (order-invariant), keep catalog order
-        p_fine, info = self._score_request(state, self._sub_catalog(cat, top, fine), fresh=True)
+        p_fine, info = self._score_request(state, self._sub_catalog(cat, top, fine), fresh=True, media=media)
         info.update({"coarse_kept": len(top), "coarse_tokens": cat["prefix_len"] + n * coarse,
                      "fine_tokens": cat["prefix_len"] + len(top) * fine})
         return p_fine, info
