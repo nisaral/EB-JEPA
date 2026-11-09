@@ -194,13 +194,15 @@ class SoroKevModel(nn.Module):
                     else:
                         load_kw["torch_dtype"] = dtype
                 loaded = None
-                for attn_name in ("sdpa", "eager"):
+                # Gemma 4's audio tower has no SDPA kernel: keep SDPA for text/vision, eager for audio.
+                mixed = {"text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"}
+                for attn_name in ("sdpa", mixed, "eager"):
                     try:
                         loaded = AutoModel.from_pretrained(
                             model_name, attn_implementation=attn_name, **load_kw
                         )
                         break
-                    except TypeError:
+                    except (TypeError, ValueError):
                         continue
                 if loaded is None:
                     loaded = AutoModel.from_pretrained(model_name, **load_kw)
