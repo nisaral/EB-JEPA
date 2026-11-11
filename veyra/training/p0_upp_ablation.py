@@ -80,6 +80,8 @@ CONFIGS = {
     "E0": UPPConfig(layout="catalog_first", head="dot"),
     "FX": UPPConfig(layout="block", readout="xattn"),
     "KMX": UPPConfig(layout="block", gists=8, gist_budgets=(1, 2, 4, 8), gist_distill=1.0, readout="xattn"),
+    # late MaxSim over 4 gists: request tokens see option summaries without a refiner
+    "L0": UPPConfig(layout="block", gists=4, interaction="late"),
 }
 
 DATA = REPO / "releases" / "soro-universal-tool-harness"
