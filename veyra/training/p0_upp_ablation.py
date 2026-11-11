@@ -74,14 +74,29 @@ CONFIGS = {
     "J2": UPPConfig(layout="block", gists=4, gist_distill=1.0, head="rbf", refiner=True, ensemble=4),
     # round 4: Matryoshka gists (one cache for coarse retrieval + fine listwise rerank)
     "KM": UPPConfig(layout="block", gists=8, gist_budgets=(1, 2, 4, 8), gist_distill=1.0, refiner=True),
+    # round 5: options read the request (cross-attention readout; fixes block configs at chance)
+    # diagnostics: same as F / E without the refiner (A, which trains, has none)
+    "F0": UPPConfig(layout="block", head="dot"),
+    "E0": UPPConfig(layout="catalog_first", head="dot"),
+    "FX": UPPConfig(layout="block", readout="xattn"),
+    "KMX": UPPConfig(layout="block", gists=8, gist_budgets=(1, 2, 4, 8), gist_distill=1.0, readout="xattn"),
 }
 
 DATA = REPO / "releases" / "soro-universal-tool-harness"
 
 
 def resolve_data_dir(arg: str | None) -> Path:
-    """Local release dir, an explicit --data-dir, or the public HF dataset (Kaggle/Colab)."""
-    for cand in [Path(arg)] if arg else [DATA]:
+    """Local release dir, omni build dir, an explicit --data-dir, or the public HF dataset."""
+    candidates = []
+    if arg:
+        candidates.append(Path(arg))
+    else:
+        candidates.extend([
+            DATA,
+            REPO / "veyra" / "runs" / "omni_data" / "build",
+            REPO / "veyra" / "data" / "soro_kev_dataset",
+        ])
+    for cand in candidates:
         if (cand / "train.jsonl").exists():
             return cand
     from huggingface_hub import snapshot_download
@@ -90,9 +105,37 @@ def resolve_data_dir(arg: str | None) -> Path:
                                   allow_patterns=["train.jsonl", "val_zeroshot.jsonl"]))
 
 
+def to_kev_record(r: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept Soro-Kev rows or OmniRow jsonl from the omni build."""
+    if "questions" in r and "tool_route" in r["questions"]:
+        return r
+    options = r.get("options") or []
+    crit = {o["key"]: o["text"] for o in options if o.get("key") and o.get("text")}
+    label = r.get("label")
+    if not crit or label not in crit:
+        return None
+    ctx = r.get("context") or ""
+    text = r.get("text") or ""
+    state = (f"Context: {ctx}\n" if ctx else "") + f"User Request: {text}"
+    return {
+        "id": r.get("id"),
+        "state": state,
+        "questions": {"tool_route": {"criteria": crit, "label": label}},
+        "source": r.get("source"),
+        "package": r.get("package"),
+    }
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
     with path.open(encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            if not line.strip():
+                continue
+            rec = to_kev_record(json.loads(line))
+            if rec is not None:
+                rows.append(rec)
+    return rows
 
 
 def load_bfcl() -> list[dict[str, Any]]:
@@ -334,6 +377,8 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
     n_train = sum(p.numel() for p in params)
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
     steps = max(1, len(train_rows) // args.batch)
+    if getattr(args, "max_steps", 0):
+        steps = min(steps, args.max_steps)
     use_bf16 = bf16_ok
     use_fp16 = device == "cuda" and not bf16_ok and not four_bit
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
@@ -491,6 +536,7 @@ def main() -> None:
     ap.add_argument("--configs", default="A,B,C,D,E")
     ap.add_argument("--base-model", default="Qwen/Qwen2.5-0.5B")
     ap.add_argument("--train-rows", type=int, default=4000)
+    ap.add_argument("--max-steps", type=int, default=0, help="Cap optimizer steps (0 = one pass over train-rows).")
     ap.add_argument("--eval-rows", type=int, default=300)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -517,7 +563,14 @@ def main() -> None:
     train_all, selection = split_selection_packages(train_all, frac=0.05, seed=args.seed)
     rng = random.Random(args.seed)
     rng.shuffle(train_all)
-    zs = read_jsonl(data_dir / "val_zeroshot.jsonl")
+    zs_path = next((p for p in (
+        data_dir / "val_zeroshot.jsonl",
+        data_dir / "test.jsonl",
+        data_dir.parent / "stage_text" / "eval_zeroshot.jsonl",
+    ) if p.exists()), None)
+    if zs_path is None:
+        raise FileNotFoundError(f"No val_zeroshot.jsonl or test.jsonl under {data_dir}")
+    zs = read_jsonl(zs_path)
     stride = max(1, len(zs) // args.eval_rows)
     evals = {
         "selection": selection[: args.eval_rows],

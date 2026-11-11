@@ -205,3 +205,25 @@ def test_media_slot_count_must_match_embeddings():
         m.score("", {"a": "tool a", "__abstain__": "none"}, media=bad)
     with pytest.raises(ValueError):  # raw paths need media=True
         m.score("", {"a": "tool a", "__abstain__": "none"}, media={"audio": "x.wav"})
+
+
+def test_xattn_readout_is_order_equivariant_and_trains_on_mock():
+    from soro.routing.upp import XAttnHead
+    torch.manual_seed(0)
+    head = XAttnHead(D, UPPConfig(proj_dim=16)).eval()
+    h_req, h_opts = torch.randn(7, D), torch.randn(5, D)
+    perm = torch.tensor([3, 0, 4, 1, 2])
+    with torch.no_grad():
+        a, _ = head(h_req, h_opts)
+        b, _ = head(h_req, h_opts[perm])
+    assert torch.allclose(a[perm], b, atol=1e-5)
+    for kw in ({}, {"gists": 2, "gist_budgets": (1, 2), "gist_distill": 1.0}):
+        m = UPPModel(UPPConfig(layout="block", readout="xattn", **kw), use_mock=True)
+        out = m.forward_batch([REC, REC])
+        out["loss"].backward()
+        assert m.head.out.weight.grad is not None
+        m.eval()
+        crit = REC["questions"]["tool_route"]["criteria"]
+        p, _ = m.score(REC["state"], crit)
+        q, _ = m.score(REC["state"], dict(reversed(list(crit.items()))))
+        assert max(abs(p[k] - q[k]) for k in p) < 1e-5

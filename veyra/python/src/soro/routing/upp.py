@@ -91,6 +91,11 @@ class UPPConfig:
     # depends on which other tools share the catalog (options are truncated to fit).
     request_offset: int = 640
     gist_budgets: tuple[int, ...] = field(default_factory=tuple)  # e.g. (1, 2, 4, 8)
+    # Readout. ``vec``: last request token vs one vector per option (needs the request token to
+    # carry the answer). ``xattn``: each option vector cross-attends to all request token states
+    # in a small post-backbone head (options never see each other, so scores stay exactly order
+    # equivariant and the catalog cache is unchanged).
+    readout: str = "vec"  # vec | xattn
 
     def name(self) -> str:
         parts = [self.layout, self.head]
@@ -112,6 +117,8 @@ class UPPConfig:
             parts.append(self.interaction)
         if self.option_pool != "last":
             parts.append(f"pool-{self.option_pool}")
+        if self.readout != "vec":
+            parts.append(self.readout)
         return "+".join(parts)
 
 
@@ -215,6 +222,37 @@ class AttnPool(nn.Module):
         return (w.unsqueeze(-1) * h.float()).sum(0)
 
 
+class XAttnHead(nn.Module):
+    """Options read the request: per-option cross-attention over request token states.
+
+    Each option is scored independently of the others (no option-option attention), so
+    permuting the menu permutes the logits exactly. Logits are a linear readout, no temperature."""
+
+    def __init__(self, d_model: int, cfg: UPPConfig, layers: int = 2):
+        super().__init__()
+        self.cfg = cfg
+        p = cfg.proj_dim
+        self.norm = nn.LayerNorm(d_model)
+        self.q_in, self.k_in = nn.Linear(d_model, p), nn.Linear(d_model, p)
+        self.attn = nn.ModuleList(nn.MultiheadAttention(p, 4, batch_first=True) for _ in range(layers))
+        self.ln = nn.ModuleList(nn.LayerNorm(p) for _ in range(2 * layers))
+        self.ff = nn.ModuleList(nn.Sequential(nn.Linear(p, 2 * p), nn.GELU(), nn.Linear(2 * p, p))
+                                for _ in range(layers))
+        self.out = nn.Linear(p, 1)
+
+    def forward(self, h_req: torch.Tensor, h_opts: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """h_req: (Lq, d) request token states; h_opts: (K, d) -> logits (K,)."""
+        r = self.q_in(self.norm(h_req.float())).unsqueeze(0)  # (1, Lq, p)
+        o = self.k_in(self.norm(h_opts.float())).unsqueeze(1)  # (K, 1, p): one query per option
+        mem = r.expand(o.shape[0], -1, -1)
+        for i, attn in enumerate(self.attn):
+            x = self.ln[2 * i](o)
+            o = o + attn(x, mem, mem, need_weights=False)[0]
+            o = o + self.ff[i](self.ln[2 * i + 1](o))
+        logits = self.out(o.squeeze(1)).squeeze(-1)
+        return logits, {"energy": torch.logsumexp(logits, -1), "u": 1.0 - F.softmax(logits, -1).max()}
+
+
 class LateHead(nn.Module):
     """ColBERT-style late interaction: mean over request tokens of max similarity to option gists."""
 
@@ -278,7 +316,12 @@ class UPPModel(nn.Module):
         self._mock_tok = base._tokenize_text
         d_model = base.q_proj_head.in_features
         del base
-        self.head = LateHead(d_model, cfg) if cfg.interaction == "late" else UPPHead(d_model, cfg)
+        if cfg.interaction == "late":
+            self.head = LateHead(d_model, cfg)
+        elif cfg.readout == "xattn":
+            self.head = XAttnHead(d_model, cfg)
+        else:
+            self.head = UPPHead(d_model, cfg)
         self.pool = AttnPool(d_model) if cfg.option_pool == "attn" else None
         emb = self._embed_layer().weight
         # learned tokens start at the embedding layer's real scale (Gemma multiplies by sqrt(d))
@@ -593,6 +636,8 @@ class UPPModel(nn.Module):
             gist = torch.stack([h[ix + [ix[-1]] * (g - len(ix))] for ix in opt_idx])
             return self.head(h[pk["req_idx"]], gist)
         opts = torch.stack([self._pool(h[ix]) for ix in opt_idx])
+        if self.cfg.readout == "xattn":
+            return self.head(h[pk["req_idx"]], opts)
         return self.head(h[pk["q_idx"]], opts)
 
     # ------------------------------------------------------------------ forward
@@ -751,7 +796,7 @@ class UPPModel(nn.Module):
                     if extra_tokens > 0:
                         past.crop(-extra_tokens)
             opts = torch.stack([self._pool(s) for s in cat["opt_states"]])
-            logits, aux = self.head(h[0, -1], opts)
+            logits, aux = self.head(h[0] if self.cfg.readout == "xattn" else h[0, -1], opts)
         p = F.softmax(logits, -1).float().cpu().tolist()
         return {k: p[i] for i, k in enumerate(cat["keys"])}, {"u": float(aux["u"])}
 
