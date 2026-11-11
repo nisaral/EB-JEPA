@@ -55,6 +55,17 @@ def test_dedupe_exact_and_near_duplicates():
     assert stats["exact_dupes"] == 1 and stats["near_dupes"] == 1 and len(kept) == 2
 
 
+def test_dedupe_keeps_audio_twin_of_the_same_request():
+    text = _row(1, "will it rain tomorrow")
+    spoken = _row(2, "")
+    spoken.modality = "audio"
+    spoken.transcript = "will it rain tomorrow"
+    spoken.audio = "a.wav"
+    spoken.group = text.group
+    kept, stats = quality.dedupe([text, spoken], near_threshold=0.7)
+    assert len(kept) == 2 and stats.get("near_dupes", 0) == 0
+
+
 def test_leakage_finds_shared_queries_and_packages():
     train = [_row(1, "list every file in my downloads folder", pkg="files")]
     ev = [_row(9, "list every file in my downloads folder", pkg="files"), _row(10, "totally different ask", pkg="x")]

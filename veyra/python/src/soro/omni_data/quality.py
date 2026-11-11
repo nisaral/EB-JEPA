@@ -94,6 +94,7 @@ def dedupe(rows: list[OmniRow], near_threshold: float = 0.85, max_per_group_labe
         for c in lsh.candidates_and_add(idx, lsh.signature(sh)):
             other = kept_at.get(c)
             if (other is not None and other.label == r.label and other.image == r.image
+                    and other.modality == r.modality
                     and sorted(o.key for o in other.options) == menu and jaccard(sh, sh_cache[c]) >= near_threshold):
                 dup = True
                 break
