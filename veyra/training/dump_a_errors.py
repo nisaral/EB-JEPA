@@ -102,6 +102,8 @@ def main() -> None:
                 n += 1
                 if i_row == 1 or i_row % 25 == 0:
                     print(f"{split} {i_row}/{len(rows)} acc={hit/max(n,1):.3f} errors={n-hit}", flush=True)
+                if i_row % 50 == 0:
+                    torch.cuda.empty_cache()
                 ok = pred == gold
                 hit += int(ok)
                 if ok:
