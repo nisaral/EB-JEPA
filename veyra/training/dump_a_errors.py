@@ -63,7 +63,7 @@ def main() -> None:
     if not scorer.load():
         raise SystemExit(scorer.error)
     model = scorer._neural_model
-    model.inference_max_seq_len = 1024
+    model.inference_max_seq_len = 768
     all_err = []
     summary = {}
     for split, path in files.items():
@@ -79,19 +79,23 @@ def main() -> None:
                 q = r["questions"]["tool_route"]
                 crit = q["criteria"]
                 gold = q["label"]
-                if len(crit) > 24:
+                import torch
+                if len(crit) > 16:
                     gold_txt = crit.get(gold, "")
-                    others = [(k, v) for k, v in crit.items() if k != gold]
-                    others = others[:23]
+                    others = [(k, v) for k, v in crit.items() if k != gold][:15]
                     crit = dict(others)
                     if gold in q["criteria"]:
                         crit[gold] = gold_txt
-                logits, keys = model.score_choice_sequence(
-                    r["state"], q.get("instructions") or "Which tool?", crit, max_seq_len=1024
-                )
+                try:
+                    logits, keys = model.score_choice_sequence(
+                        r["state"], q.get("instructions") or "Which tool?", crit, max_seq_len=768
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    print(f"{split} {i_row}/{len(rows)} OOM skip", flush=True)
+                    continue
                 if logits.numel() == 0 or not keys:
                     continue
-                import torch
                 probs = torch.softmax(logits.float(), dim=-1)
                 pred = keys[int(torch.argmax(probs).item())]
                 pmap = {k: float(probs[i]) for i, k in enumerate(keys)}
