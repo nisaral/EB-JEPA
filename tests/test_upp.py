@@ -541,3 +541,9 @@ def test_s2_teacher_kl_init_ckpt_and_eval_ask_or_exact(tmp_path):
     assert rep["total"] == 2 and rep["teacher_coverage"] == 1.0
     assert rep["label_audit"]["flagged"] == 1 and rep["label_audit"]["checked"] == 2
     assert len(list(read_rows(merged_path))) == 2
+
+    filtered_path = tmp_path / "merged_filtered.jsonl"
+    frep = merge_and_validate([p0_path, p1_path], filtered_path, filter_mode="exact", strip_probs=True)
+    frows = list(read_rows(filtered_path))
+    assert frep["kept"] == 1 and frep["dropped"] == 1
+    assert [r.id for r in frows] == ["lbl-1"] and "probs" not in (frows[0].teacher or {})

@@ -25,8 +25,11 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "veyra" / "python" / "src"))
 sys.path.insert(0, str(REPO / "veyra" / "training"))
 
+from collections import Counter
+
 from judge_s2_sample import S2TeacherJudge, score_rows_batched  # noqa: E402
 from soro.omni_data import quality  # noqa: E402
+from soro.omni_data.s2_actions import action_kind  # noqa: E402
 from soro.omni_data.schema import OmniRow, read_rows, write_rows  # noqa: E402
 
 
@@ -46,7 +49,14 @@ def attach_teacher(row: OmniRow, probs: dict[str, float], model_id: str, rotatio
     )
 
 
-def merge_and_validate(shard_paths: list[Path], out_path: Path, report_path: Path | None = None) -> dict[str, Any]:
+def merge_and_validate(
+    shard_paths: list[Path],
+    out_path: Path,
+    report_path: Path | None = None,
+    *,
+    filter_mode: str = "none",
+    strip_probs: bool = False,
+) -> dict[str, Any]:
     by_id: dict[str, OmniRow] = {}
     ordered: list[OmniRow] = []
     for sp in shard_paths:
@@ -58,12 +68,53 @@ def merge_and_validate(shard_paths: list[Path], out_path: Path, report_path: Pat
     valid, bad = quality.validate_rows(ordered)
     if bad:
         raise ValueError(f"{len(bad)} invalid rows during teacher merge; first={bad[0]}")
-    write_rows(valid, out_path)
-    audit = quality.label_audit(valid)
+
+    kept: list[OmniRow] = []
+    drop_by_act: Counter[str] = Counter()
+    total_by_act: Counter[str] = Counter()
+    drop_by_source: Counter[str] = Counter()
+    exact_agree = 0
+    kind_agree = 0
+    for r in valid:
+        gk = action_kind(r.label)
+        total_by_act[gk] += 1
+        t = r.teacher or {}
+        top = str(t.get("top") or "")
+        ex_ok = bool(top == r.label)
+        kn_ok = bool(top and action_kind(top) == gk)
+        exact_agree += int(ex_ok)
+        kind_agree += int(kn_ok)
+        keep = True
+        if filter_mode == "exact":
+            keep = ex_ok
+        elif filter_mode == "kind":
+            keep = kn_ok
+        if keep:
+            if strip_probs and r.teacher is not None:
+                kept.append(replace(r, teacher={k: v for k, v in r.teacher.items() if k != "probs"}))
+            else:
+                kept.append(r)
+        else:
+            drop_by_act[gk] += 1
+            drop_by_source[str(r.source)] += 1
+
+    write_rows(kept, out_path)
+    audit = quality.label_audit(kept)
+    n_valid = max(len(valid), 1)
     summary = {
-        "total": len(valid),
-        "teacher_coverage": sum(1 for r in valid if r.teacher and r.teacher.get("probs")) / max(len(valid), 1),
-        "agreement": sum(1 for r in valid if (r.teacher or {}).get("agrees")) / max(len(valid), 1),
+        "total": len(kept),
+        "total_scored": len(valid),
+        "kept": len(kept),
+        "dropped": len(valid) - len(kept),
+        "filter_mode": filter_mode,
+        "strip_probs": bool(strip_probs),
+        "teacher_coverage": sum(1 for r in valid if r.teacher and r.teacher.get("probs")) / n_valid,
+        "exact_agreement": exact_agree / n_valid,
+        "kind_agreement": kind_agree / n_valid,
+        "total_by_action": dict(sorted(total_by_act.items())),
+        "dropped_by_action": dict(sorted(drop_by_act.items())),
+        "kept_by_action": {k: total_by_act[k] - drop_by_act.get(k, 0) for k in sorted(total_by_act)},
+        "dropped_by_source": dict(sorted(drop_by_source.items())),
         "label_audit": audit,
     }
     if report_path is not None:
@@ -81,6 +132,8 @@ def main() -> None:
     ap.add_argument("--shard", default="0/1", help="Shard idx/total, e.g. 0/2 or 1/2")
     ap.add_argument("--max-rows", type=int, default=0)
     ap.add_argument("--merge", default="", help="Comma-separated shard JSONLs to merge & validate")
+    ap.add_argument("--filter-mode", choices=("none", "exact", "kind"), default="none", help="Filter disagreed rows during --merge")
+    ap.add_argument("--strip-probs", action="store_true", help="Drop teacher.probs when soft-label +3pt gate did not pass")
     ap.add_argument("--out", required=True, help="Output dir (sharding) or output JSONL (--merge)")
     args = ap.parse_args()
 
@@ -88,7 +141,13 @@ def main() -> None:
         shards = [Path(p.strip()) for p in args.merge.split(",") if p.strip()]
         out_p = Path(args.out)
         out_p.parent.mkdir(parents=True, exist_ok=True)
-        rep = merge_and_validate(shards, out_p, out_p.with_suffix(".audit.json"))
+        rep = merge_and_validate(
+            shards,
+            out_p,
+            out_p.with_suffix(".audit.json"),
+            filter_mode=args.filter_mode,
+            strip_probs=args.strip_probs,
+        )
         print(json.dumps(rep, indent=2))
         return
 
