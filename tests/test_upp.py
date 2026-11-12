@@ -433,3 +433,25 @@ def test_isolated_options_with_stabilized_refiner_preserves_invariance_and_initi
     mem = m_ref.head.members[0]
     assert mem.ref_gate.grad is not None and mem.type_emb.grad is not None
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in mem.refiner.parameters())
+
+
+def test_compare_upp_eval_mcnemar_and_exact_pairing():
+    import sys
+    from pathlib import Path
+
+    tr_dir = Path(__file__).resolve().parents[1] / "veyra" / "training"
+    if str(tr_dir) not in sys.path:
+        sys.path.insert(0, str(tr_dir))
+    from compare_upp_eval import compare_pair, mcnemar_exact
+
+    # 12 discordant pairs: 10 A-only, 2 B-only -> exact 2-sided p = 2*(C(12,0)+C(12,1)+C(12,2))/4096 = 158/4096
+    mc = mcnemar_exact(10, 2)
+    assert abs(mc["p_exact"] - (158.0 / 4096.0)) < 1e-12
+    assert mc["discordant"] == 12
+
+    rows_a = [{"split": "collisions", "orig_idx": i, "id": f"c{i}", "ok": int(i < 15), "flipped": int(i == 0)} for i in range(20)]
+    rows_b = [{"split": "collisions", "orig_idx": i, "id": f"c{i}", "ok": int(i < 5 or i >= 15), "flipped": 0} for i in range(20)]
+    stats = compare_pair(rows_a, rows_b)
+    col = stats["collisions"]
+    assert col["n"] == 20 and col["n10_a_only"] == 10 and col["n01_b_only"] == 5 and abs(col["delta_pts"] - (-25.0)) < 1e-9
+    assert col["flips_a"] == 1 and col["flips_b"] == 0

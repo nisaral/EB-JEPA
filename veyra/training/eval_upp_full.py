@@ -302,9 +302,12 @@ def main() -> None:
             blob = json.loads(Path(p_str).read_text(encoding="utf-8"))
             meta_cfg = blob.get("model") or meta_cfg
             merged_rows.extend(blob["rows"])
+        split_order = {s: idx for idx, s in enumerate(dict.fromkeys(r["split"] for r in merged_rows))}
+        merged_rows.sort(key=lambda r: (split_order[r["split"]], r["orig_idx"]))
         summary = summarize_by_split(merged_rows)
         md = format_markdown(summary, title=meta_cfg.get("config", "Full Evaluation"))
         payload = {"model": meta_cfg, "summary": summary}
+        (out_dir / "scored_rows.json").write_text(json.dumps({"model": meta_cfg, "rows": merged_rows}), encoding="utf-8")
         (out_dir / "full_eval.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         (out_dir / "full_eval.md").write_text(md + "\n", encoding="utf-8")
         print(md)
@@ -347,7 +350,14 @@ def main() -> None:
         )
         all_scored.extend(scored)
 
-    model_meta = {"config": model.cfg.name(), "cfg": model.config_dict(), "ckpt": str(args.ckpt), "flip_orders": args.flip_orders}
+    model_meta = {
+        "config": model.cfg.name(),
+        "cfg": model.config_dict(),
+        "ckpt": str(args.ckpt),
+        "flip_orders": args.flip_orders,
+        "seed": args.seed,
+        "amp": bool(args.amp),
+    }
     if shard_total > 1:
         shard_path = out_dir / f"scored_shard_{shard_idx}.json"
         shard_path.write_text(json.dumps({"model": model_meta, "rows": all_scored}), encoding="utf-8")
@@ -357,6 +367,7 @@ def main() -> None:
     summary = summarize_by_split(all_scored)
     md = format_markdown(summary, title=model.cfg.name())
     payload = {"model": model_meta, "summary": summary}
+    (out_dir / "scored_rows.json").write_text(json.dumps({"model": model_meta, "rows": all_scored}), encoding="utf-8")
     (out_dir / "full_eval.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     (out_dir / "full_eval.md").write_text(md + "\n", encoding="utf-8")
     print(md)
