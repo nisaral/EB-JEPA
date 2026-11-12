@@ -466,3 +466,71 @@ def test_s2_clean_filters_schema_star_and_done_target():
     r_other_target = _row(13, "What is the weather today in Pune?", label="get_weather", tools=("__done__", "get_weather"))
     s2_other = wrap_s2_row(r_other_target, shuffle_seed=0)
     assert "__done__" not in {o.key for o in s2_other.options} and {ANSWER, ASK, ESCALATE, ABSTAIN} <= {o.key for o in s2_other.options}
+
+
+def test_s2_strict_hygiene_regressions():
+    import sys
+    from pathlib import Path
+    from soro.omni_data.s2_actions import (
+        build_abstain_cross_domain,
+        build_answer_from_soro,
+        build_ask_from_soro,
+        build_escalate_from_soro,
+        from_when2call_pref,
+    )
+
+    tr_dir = Path(__file__).resolve().parents[1] / "veyra" / "training"
+    if str(tr_dir) not in sys.path:
+        sys.path.insert(0, str(tr_dir))
+    from judge_s2_sample import _JUDGE_CARD_TEXT
+
+    # 1. Date strings (09/29/2023), partial domains (example.com/foo leaving example.com), and dual-IDs do not become broken ~ask rows.
+    date_row = _row(20, "Find all seismic events between 08 and 09/29/2023 in Tokyo", label="find_earthquakes", tools=("find_earthquakes", "get_weather"))
+    dom_row = _row(21, "Download the HTML source from example.com/docs/intro right now", label="fetch_web_page", tools=("fetch_web_page", "get_weather"))
+    dual_row = _row(22, "Email alice@example.com with the barcode 0737628064502 details", label="send_email", tools=("send_email", "get_weather"))
+    asks = build_ask_from_soro([date_row, dom_row, dual_row], limit=10, seed=0)
+    ask_parents = {r.meta["parent"]: r.text for r in asks}
+    assert "20" not in ask_parents and "22" not in ask_parents
+    assert "21" in ask_parents and "example.com" not in ask_parents["21"]
+
+    # 2. Safe/reversible/temporary tools (archive_email, without deleting, /tmp/) do not trigger ~esc.
+    esc_cands = [
+        _row(30, "File this message away without deleting it", label="archive_email", tools=("archive_email", "reply_email")),
+        _row(31, "Remove temporary file at /tmp/scratch.txt cleanly", label="delete_file", tools=("delete_file", "read_file")),
+        _row(32, "Drop the production billing_ledger records immediately", label="delete_database_record", tools=("delete_database_record", "read_file")),
+    ]
+    escs = build_escalate_from_soro(esc_cands, limit=10, seed=0)
+    assert [r.meta["parent"] for r in escs] == ["32"]
+
+    # 3. Anaphoric / short queries are skipped by build_abstain_cross_domain.
+    unrelated = [
+        Option("compile_shader", "Compile shader"),
+        Option("prune_orchard", "Prune orchard"),
+        Option("tune_piano", "Tune piano"),
+        Option("brew_espresso", "Brew espresso"),
+        Option("calc_orbit", "Calc orbit"),
+    ]
+    ab_cands = [
+        _row(40, "Give me the outbound links on that site. Handle it from the last step.", label="fetch_links", tools=("fetch_links", "send_email")),
+        _row(41, "I want the file", label="get_file", tools=("get_file", "send_email")),
+        _row(42, "Retrieve customer billing invoices from Stripe for March 2025", label="list_invoices", tools=("list_invoices", "send_email")),
+    ]
+    xabs = build_abstain_cross_domain(ab_cands, unrelated, limit=10, seed=0)
+    assert [r.meta["parent"] for r in xabs] == ["42"]
+
+    # 4. Single shared domain noun rejects false When2Call ABSTAIN (billboard Hot 100 vs billboard_200).
+    b200 = json.dumps({"name": "billboard_200", "description": "Fetch Billboard 200 chart songs", "parameters": {"properties": {"date": {"type": "string"}}}})
+    w2c_false_ab = [{
+        "tools": [b200],
+        "messages": [{"role": "user", "content": "What were the top songs on the Billboard Hot 100 chart last week?"}],
+        "chosen_response": {"role": "assistant", "content": "Sorry, I cannot fetch Billboard Hot 100."},
+        "rejected_response": {"role": "assistant", "content": '<TOOLCALL>[{"name": "billboard_hot_100", "arguments": {}}]</TOOLCALL>'},
+    }]
+    assert from_when2call_pref(w2c_false_ab, clean_s2=True) == []
+
+    # 5. post_tool_answer prefers read tools over mutations when both exist, and judge card text omits cost numbers.
+    read_r = _row(50, "Check the current weather in Pune", label="get_weather", tools=("get_weather", "delete_file"))
+    mut_r = _row(51, "Delete old log files now", label="delete_file", tools=("get_weather", "delete_file"))
+    anss = build_answer_from_soro([mut_r, read_r], limit=5, seed=0, include_direct_qa=False)
+    assert [r.meta["completed_tool"] for r in anss] == ["get_weather"]
+    assert not any("0.40" in v or "0.50" in v or "1.5" in v for v in _JUDGE_CARD_TEXT.values())

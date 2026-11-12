@@ -32,7 +32,9 @@ sys.path.insert(0, str(REPO / "veyra" / "training"))
 
 from soro.omni_data import licenses, quality  # noqa: E402
 from soro.omni_data.s2_actions import (  # noqa: E402
+    _ANAPHORIC_OR_VAGUE_RE,
     _ctoks,
+    _distinctive_toks,
     action_kind,
     build_abstain_cross_domain,
     build_ambiguous_ask,
@@ -488,14 +490,24 @@ def build_s2_dataset(
         and is_clean_soro_row(r)
         and not _touches_forbidden(r, ev_forb_tools, ev_forb_pkgs, ev_forb_groups, ev_forb_ids)
     ]
-    # Keep only clean raw soro ABSTAIN rows that neither look like pure LLM QA nor overlap any option key tokens.
+    # Keep only clean raw soro ABSTAIN rows that are self-contained, non-anaphoric, and non-overlapping with any tool.
     soro_filtered: list[OmniRow] = []
     for r in soro_clean:
         if r.label == ABSTAIN:
-            if is_pure_llm_prompt(r.text):
+            if (
+                is_pure_llm_prompt(r.text)
+                or len((r.text or "").split()) < 8
+                or _ANAPHORIC_OR_VAGUE_RE.search(r.text or "")
+            ):
                 continue
-            qt = _ctoks(r.text)
-            if any(len(qt & _ctoks(o.key.replace("_", " "))) >= 1 and len(qt & _ctoks(o.text)) >= 2 for o in r.options if o.kind == "tool"):
+            qt = _distinctive_toks(r.text)
+            q_stems = {t[:5] for t in _ctoks(r.text) if len(t) >= 4}
+            if any(
+                (qt & _distinctive_toks(f"{o.key.replace('_', ' ')} {o.text[:240]}"))
+                or (q_stems & {t[:5] for t in _ctoks(o.key.replace("_", " ")) if len(t) >= 4})
+                for o in r.options
+                if o.kind == "tool"
+            ):
                 continue
         soro_filtered.append(r)
 
@@ -528,11 +540,12 @@ def build_s2_dataset(
     sel_tool_rows = [r for r in sel_soro if r.label != ABSTAIN]
     sel_cols = mine_collisions(sel_tool_rows, pool_sel, per_row=3, rate=0.35, seed=seed + 1)
 
+    tr_w2c_tools = [r for r in tr_w2c if r.label not in SPECIAL]
     tr_soro_s2 = [wrap_s2_row(r, shuffle_seed=i) for i, r in enumerate(tr_soro + tr_cols)]
     tr_ask_param = build_ask_from_soro(tr_soro, limit=1000, seed=seed + 10)
     tr_ask_ambig = build_ambiguous_ask(tr_soro, limit=500, seed=seed + 11)
     tr_ab_cross = build_abstain_cross_domain(tr_soro, list(pool_tr.tools.values()), limit=1800, seed=seed + 17)
-    tr_esc = build_escalate_from_soro(tr_soro, limit=1800, seed=seed + 20)
+    tr_esc = build_escalate_from_soro(tr_soro + tr_w2c_tools, limit=1800, seed=seed + 20)
     tr_ans = build_answer_from_soro(tr_soro, limit=1800, seed=seed + 30, include_direct_qa=True)
     tr_soro_s2 += tr_ask_param + tr_ask_ambig + tr_ab_cross + tr_esc + tr_ans
 

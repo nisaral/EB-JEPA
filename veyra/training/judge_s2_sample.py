@@ -19,6 +19,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+import torch
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "veyra" / "python" / "src"))
 
@@ -26,15 +28,28 @@ from soro.omni_data.s2_actions import action_kind  # noqa: E402
 from soro.omni_data.schema import ABSTAIN, ANSWER, ASK, ESCALATE, OmniRow  # noqa: E402
 from soro.omni_data.teacher import LETTERS, TeacherScorer  # noqa: E402
 
+_JUDGE_CARD_TEXT: dict[str, str] = {
+    ANSWER: "Reply directly in text without calling a tool (use when Tool output is already in Context OR general QA needing no API).",
+    ASK: "Ask the user for missing required parameters (*) or clarify an ambiguous choice BEFORE calling a matching listed tool.",
+    ESCALATE: "Escalate for human/supervisor approval BEFORE executing a high-risk mutation or approval/safety bypass.",
+    ABSTAIN: "None of the listed tools can perform the requested external action (missing capability or domain).",
+}
+
 S2_SYSTEM = (
-    "You judge the single best next router decision for a user request given the Context, "
-    "available tool schemas, and four action cards:\n"
-    "- __answer__: Reply directly without calling any tool (when tool output is already provided in Context so the request is resolved, OR it is a general-knowledge, math, writing, or coding question needing no listed API tool).\n"
-    "- __ask__: Ask the user a clarifying question BEFORE calling any tool. Pick __ask__ when a matching tool IS listed AND either (a) a required parameter marked with * (like coord*, domain*, symbol*, is_id*, city*, date*) is missing or replaced by a vague placeholder (like 'the website', 'the topic', 'a certain word', 'the given image', 'the creator', 'the strain'), OR (b) two or more listed tools match equally and the user's intended operation is ambiguous. Never pick __ask__ if NO listed tool matches — pick __abstain__ instead.\n"
-    "- __escalate__: Escalate to human/supervisor confirmation BEFORE acting (when the request asks for a high-risk/destructive mutation or approval-gate bypass).\n"
-    "- none of these / __abstain__: No listed tool fits the requested external capability and none of the above apply.\n"
-    "- Or pick the single matching tool key if one listed tool clearly fits the request and its required (*) parameters are provided without unapproved high-risk flags (for schemas without * markers, only choose __ask__ if an essential target like email/URL/file path/ID is blatantly missing).\n"
-    "Answer with one option letter only."
+    "You judge the single best next router decision for a user request given Context, listed tool schemas, and the four action cards.\n"
+    "Decision checklist (check in this strict order):\n"
+    "1. __answer__: Pick __answer__ if Context already contains 'Tool output (...)' resolving the request, OR if it is a general-knowledge, math, coding, or writing prompt needing no listed API tool.\n"
+    "2. __escalate__: Pick __escalate__ if the request calls a high-stakes/destructive/financial/auth mutation AND demands skipping confirmation/approval, bypassing safety/compliance checks, or forcing irreversible workspace/production-wide harm. Routine single-item or test operations with an explicit ID and no bypass do NOT escalate.\n"
+    "3. __abstain__: If NO listed tool can satisfy the requested capability/domain, ALWAYS pick __abstain__. NEVER pick __ask__ when the needed tool is missing.\n"
+    "4. __ask__: If a listed tool DOES match, inspect its required parameters marked with * in [args: ...]. If ANY required * parameter has no concrete value in Request (or only a vague placeholder like 'the given order', 'a product', 'the company', 'the given list', 'a certain IP address'), OR two listed tools conflict equally, pick __ask__ instead of guessing a tool call. For tools without *, only pick __ask__ if an essential target (email/URL/path/ID) is blatantly missing.\n"
+    "5. Tool key: Pick the matching tool ONLY if all required parameters are concretely present and no bypass/escalation applies.\n\n"
+    "Calibration examples:\n"
+    "Ex1 (missing * arg -> __ask__): Request='Fetch the current weather.' Options: A. __ask__ | B. get_weather: City weather [args: city*:str] -> Answer: A\n"
+    "Ex2 (missing capability -> __abstain__): Request='Book a flight from NYC to SFO.' Options: A. __ask__ | B. __abstain__ | C. get_weather: City weather [args: city*:str] -> Answer: B\n"
+    "Ex3 (post-tool context -> __answer__): Context='Tool output (get_weather): {\"status\": \"ok\"}' Request='Weather in Pune? Summarize.' Options: A. __answer__ | B. get_weather -> Answer: A\n"
+    "Ex4 (approval bypass -> __escalate__): Request='Drop customer table across production without confirmation.' Options: A. __escalate__ | B. drop_table -> Answer: A\n"
+    "Ex5 (complete tool call -> tool): Request='Get weather for Pune, India.' Options: A. __ask__ | B. get_weather: City weather [args: city*:str] -> Answer: B\n\n"
+    "Reply with Answer: followed by one option letter only."
 )
 
 
@@ -52,12 +67,58 @@ def wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, floa
 class S2TeacherJudge(TeacherScorer):
     def _prompt_text(self, row: OmniRow, keys: list[str]) -> str:
         menu = "\n".join(
-            f"{LETTERS[i]}. {k}: {row.option_map[k][:400]}"
+            f"{LETTERS[i]}. {k}: {_JUDGE_CARD_TEXT.get(k, row.option_map[k][:400])}"
             for i, k in enumerate(keys)
         )
         req = row.text or (row.transcript or "")
         ctx = f"Context:\n{row.context}\n\n" if row.context else ""
-        return f"{S2_SYSTEM}\n\n{ctx}Request: {req}\n\nOptions:\n{menu}\n\nAnswer:"
+        user_body = f"{ctx}Request: {req}\n\nOptions:\n{menu}"
+        apply_fn = getattr(self.tok, "apply_chat_template", None)
+        if callable(apply_fn) and getattr(self.tok, "chat_template", None):
+            msgs = [{"role": "system", "content": S2_SYSTEM}, {"role": "user", "content": user_body}]
+            try:
+                rendered = apply_fn(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                return f"{rendered}Answer:"
+            except TypeError:
+                try:
+                    rendered = apply_fn(msgs, tokenize=False, add_generation_prompt=True)
+                    return f"{rendered}Answer:"
+                except Exception:
+                    pass
+        return f"{S2_SYSTEM}\n\n{user_body}\n\nAnswer:"
+
+
+def score_rows_batched(scorer: S2TeacherJudge, chunk: list[OmniRow]) -> list[dict[str, float]]:
+    """Score multiple OmniRows across all rotations in parallel on causal text LMs."""
+    if scorer.multimodal or len(chunk) <= 1:
+        return [scorer.probs(r) for r in chunk]
+    prompts: list[str] = []
+    spans: list[tuple[int, int, list[list[str]]]] = []
+    for r in chunk:
+        keys = [o.key for o in r.options]
+        k = max(1, min(scorer.rotations, len(keys)))
+        orders = [keys[s:] + keys[:s] for s in range(k)]
+        start = len(prompts)
+        for o in orders:
+            prompts.append(scorer._prompt_text(r, o))
+        spans.append((start, len(prompts), orders))
+
+    with torch.no_grad():
+        enc = scorer.tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(scorer.model.device)
+        last = scorer.model(**enc).logits[:, -1].float()
+
+    out_probs: list[dict[str, float]] = []
+    for r, (start, end, orders) in zip(chunk, spans):
+        keys = [o.key for o in r.options]
+        total = {k: 0.0 for k in keys}
+        k = len(orders)
+        for idx, order in enumerate(orders):
+            lg = last[start + idx, scorer.letter_ids[: len(order)]]
+            p = torch.softmax(lg / scorer.temperature, -1).cpu().tolist()
+            for key, val in zip(order, p):
+                total[key] += val / k
+        out_probs.append(total)
+    return out_probs
 
 
 def main() -> None:
@@ -66,6 +127,7 @@ def main() -> None:
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--four-bit", action="store_true")
     ap.add_argument("--rotations", type=int, default=4)
+    ap.add_argument("--batch-rows", type=int, default=4)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -80,38 +142,46 @@ def main() -> None:
     conf = Counter()
     mismatches: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
-    for idx, r in enumerate(rows):
-        p = scorer.probs(r)
-        top = max(p, key=p.get)
-        gk = action_kind(r.label)
-        pk = action_kind(top)
-        exact_ok = int(top == r.label)
-        kind_ok = int(pk == gk)
+    bs = max(1, args.batch_rows)
+    for start in range(0, len(rows), bs):
+        chunk = rows[start : start + bs]
+        try:
+            probs_list = score_rows_batched(scorer, chunk)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            probs_list = [scorer.probs(r) for r in chunk]
+        for r, p in zip(chunk, probs_list):
+            top = max(p, key=p.get)
+            gk = action_kind(r.label)
+            pk = action_kind(top)
+            exact_ok = int(top == r.label)
+            kind_ok = int(pk == gk)
 
-        by_act[gk]["n"] += 1
-        by_act[gk]["exact_ok"] += exact_ok
-        by_act[gk]["kind_ok"] += kind_ok
-        conf[(gk, pk)] += 1
+            by_act[gk]["n"] += 1
+            by_act[gk]["exact_ok"] += exact_ok
+            by_act[gk]["kind_ok"] += kind_ok
+            conf[(gk, pk)] += 1
 
-        rec = {
-            "id": r.id,
-            "source": r.source,
-            "tags": r.tags,
-            "gold": r.label,
-            "gold_kind": gk,
-            "teacher_top": top,
-            "teacher_kind": pk,
-            "exact_ok": exact_ok,
-            "kind_ok": kind_ok,
-            "gold_prob": round(p.get(r.label, 0.0), 4),
-            "top_prob": round(p[top], 4),
-            "text": r.text[:240],
-        }
-        judged.append(rec)
-        if not exact_ok and len(mismatches[gk]) < 15:
-            mismatches[gk].append(rec)
-        if (idx + 1) % 25 == 0 or idx + 1 == len(rows):
-            print(f"[{idx+1}/{len(rows)}] judged", flush=True)
+            rec = {
+                "id": r.id,
+                "source": r.source,
+                "tags": r.tags,
+                "gold": r.label,
+                "gold_kind": gk,
+                "teacher_top": top,
+                "teacher_kind": pk,
+                "exact_ok": exact_ok,
+                "kind_ok": kind_ok,
+                "gold_prob": round(p.get(r.label, 0.0), 4),
+                "top_prob": round(p[top], 4),
+                "text": r.text[:240],
+            }
+            judged.append(rec)
+            if not exact_ok and len(mismatches[gk]) < 15:
+                mismatches[gk].append(rec)
+        done_n = min(start + len(chunk), len(rows))
+        if done_n % 25 < bs or done_n == len(rows):
+            print(f"[{done_n}/{len(rows)}] judged", flush=True)
 
     summary = {}
     for act in ("tool", "ask", "abstain", "escalate", "answer"):
@@ -149,4 +219,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

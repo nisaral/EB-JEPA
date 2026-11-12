@@ -78,9 +78,14 @@ COST_MATRIX: dict[tuple[str, str], float] = {
 }
 
 _HIGH_RISK_WORDS = re.compile(
-    r"\b(delete|remove|drop|wipe|purge|truncate|revoke|transfer|wire|pay|charge|"
-    r"refund|publish|broadcast|terminate|destroy|erase|grant_admin|reset_password|"
-    r"overwrite|cancel_all|shutdown)\b",
+    r"\b(delete|drop|wipe|purge|truncate|revoke|transfer|wire|pay|charge|"
+    r"refund|publish|broadcast|terminate|destroy|erase|grant admin|reset password|"
+    r"overwrite|cancel all|shutdown|disconnect)\b",
+    re.I,
+)
+_SAFE_NON_ESCALATE_RE = re.compile(
+    r"(?:archive_email|\barchive\b|without deleting|but keep it|\binbox\b|\btemporary\b|"
+    r"\btemp_|/tmp/|\bstray build\b|\bobsolete\b|old-report|test-account|\btest_)",
     re.I,
 )
 
@@ -161,8 +166,10 @@ def infer_risk_tier(options: Iterable[Option], label: str = "") -> str:
     if label == ESCALATE:
         return "high"
     for o in options:
-        if o.kind == "tool" and (_HIGH_RISK_WORDS.search(o.key) or _HIGH_RISK_WORDS.search(o.text[:200])):
-            return "high"
+        if o.kind == "tool":
+            norm_key = o.key.replace("_", " ")
+            if _HIGH_RISK_WORDS.search(norm_key) or _HIGH_RISK_WORDS.search(o.text[:220]):
+                return "high"
     return "low"
 
 
@@ -202,7 +209,7 @@ def wrap_s2_row(
     if target not in keys:
         raise ValueError(f"S2 target label {target!r} missing from options {keys}")
     costs = compute_cost_vector(keys, target, risk_tier=tier)
-    tags = list(dict.fromkeys([*row.tags, "s2", f"s2:{action_kind(target)}", *extra_tags]))
+    tags = list(dict.fromkeys([*(t for t in row.tags if not t.startswith("s2:")), "s2", f"s2:{action_kind(target)}", *extra_tags]))
     meta = dict(row.meta)
     meta["s2"] = {
         "risk_tier": tier,
@@ -220,6 +227,12 @@ _S2_STOP = frozenset({
     "give", "using", "api", "data", "information", "details", "user", "please",
     "make", "create", "check", "set", "all", "are", "was", "were", "have", "has",
 })
+_GENERIC_ABSTAIN_TOKS = frozenset({
+    "retrieve", "obtain", "search", "query", "update", "delete", "remove", "create",
+    "build", "send", "read", "write", "load", "save", "open", "close", "tool", "service",
+    "system", "server", "record", "records", "entry", "entries", "file", "files", "item",
+    "items", "result", "results", "report", "status", "name", "type", "value", "current",
+})
 _PURE_LLM_RE = re.compile(
     r"(\[[^\]]*\d+[^\]]*\]|\b(largest|smallest)\s+\d+\s+numbers\b|\boccurrences\s+of\b|"
     r"\bextract\s+terminology\b|\bsummarize\s+this\b|\brewrite\s+this\b|"
@@ -232,10 +245,24 @@ _PAGINATION_ASK_RE = re.compile(
     r"\blimit\b|items\s+per\s+page|per\s+page|sort(?:ed|ing)?)\b",
     re.I,
 )
+_W2C_BAD_ASK_Q_RE = re.compile(
+    r"(?:your_key_here|my_custom_api_key|\bapi[ _]?key\b|^(?:can|could)\s+i\s+(?:use|have)\b)",
+    re.I,
+)
 _W2C_VAGUE_Q_RE = re.compile(
     r"\b(a certain|the given|the specific|the topic|the website|the company|the anime|"
     r"the creator|the home team|a property|the property|the strain|the video|the song|"
     r"the user|the domain|an email|the email|a file|the file|an image|the image)\b",
+    re.I,
+)
+_ANAPHORIC_OR_VAGUE_RE = re.compile(
+    r"\b(last step|this page|that page|this site|that site|this document|the document|that pdf|"
+    r"this repository|the repository|this file|that file|the file|this folder|selected item|"
+    r"whichever is open|matching entry|this message|this subject|this record|the current|that one|this one)\b",
+    re.I,
+)
+_MULTI_INTENT_RE = re.compile(
+    r"\b(at the same time|meanwhile|also plan to|after completing both|and also need)\b",
     re.I,
 )
 _NOISY_CTX_MARKERS = (
@@ -252,6 +279,10 @@ def _ctoks(text: str) -> set[str]:
     return {t for t in _S2_TOK_RE.findall((text or "").lower()) if len(t) > 2 and t not in _S2_STOP}
 
 
+def _distinctive_toks(text: str) -> set[str]:
+    return {t for t in _ctoks(text) if len(t) >= 4 and t not in _GENERIC_ABSTAIN_TOKS}
+
+
 def is_clean_soro_row(row: OmniRow, *, allow_op: bool = False, allow_val: bool = False) -> bool:
     """Filter out multi-turn persona instructions, empty-observation retries, __done__, and synthetic VAL templates."""
     if row.label == "__done__" or any(o.key == "__done__" for o in row.options):
@@ -264,6 +295,8 @@ def is_clean_soro_row(row: OmniRow, *, allow_op: bool = False, allow_val: bool =
         return False
     full = f"{row.context} {row.text}".lower()
     if any(m in full for m in _NOISY_CTX_MARKERS):
+        return False
+    if _MULTI_INTENT_RE.search(row.text or ""):
         return False
     if not allow_val and "val-" in full:
         return False
@@ -402,7 +435,7 @@ def _w2c_clean_accept(
     rj_name, rj_args = _parse_first_toolcall(rejected_content)
 
     if label == ASK:
-        if _PAGINATION_ASK_RE.search(chosen_content):
+        if _PAGINATION_ASK_RE.search(chosen_content) or _W2C_BAD_ASK_Q_RE.search(text):
             return False
         if rj_name and rj_name in tmap:
             props = (tmap[rj_name].get("parameters") or {}).get("properties") or {}
@@ -423,17 +456,26 @@ def _w2c_clean_accept(
         return bool(has_req and _W2C_VAGUE_Q_RE.search(text))
 
     if label == ABSTAIN:
-        if is_pure_llm_prompt(text):
+        if is_pure_llm_prompt(text) or len(text.split()) < 7 or _ANAPHORIC_OR_VAGUE_RE.search(text):
             return False
         if not rj_name or rj_name in tmap:
             return False
         rtoks = _ctoks(rj_name.replace("_", " "))
+        r_dist = _distinctive_toks(rj_name.replace("_", " "))
         qtoks = _ctoks(text)
+        q_dist = _distinctive_toks(text)
         for t in parsed_tools:
             nm = str(t.get("name") or "")
+            desc = str(t.get("description") or "")
             ttoks = _ctoks(nm.replace("_", " "))
-            dtoks = _ctoks(str(t.get("description") or ""))
+            t_dist = _distinctive_toks(nm.replace("_", " "))
+            dtoks = _ctoks(desc)
             if rtoks and ttoks and (len(rtoks & ttoks) / len(rtoks | ttoks)) >= 0.40:
+                return False
+            # Reject single strong shared domain noun (e.g., billboard_hot_100 vs billboard_200, crypto/coins/stock).
+            if r_dist & t_dist:
+                return False
+            if q_dist & t_dist:
                 return False
             if len(qtoks & ttoks) >= 2:
                 return False
@@ -515,13 +557,17 @@ def from_when2call_sft(
             continue
         if clean_s2:
             if label == ASK:
-                if _PAGINATION_ASK_RE.search(resp_content) or not (any("*" in o.text for o in opts) and _W2C_VAGUE_Q_RE.search(text)):
+                if (
+                    _PAGINATION_ASK_RE.search(resp_content)
+                    or _W2C_BAD_ASK_Q_RE.search(text)
+                    or not (any("*" in o.text for o in opts) and _W2C_VAGUE_Q_RE.search(text))
+                ):
                     continue
             elif label == ABSTAIN:
-                if is_pure_llm_prompt(text):
+                if is_pure_llm_prompt(text) or len(text.split()) < 7 or _ANAPHORIC_OR_VAGUE_RE.search(text):
                     continue
-                qtoks = _ctoks(text)
-                if any(len(qtoks & _ctoks(o.key.replace("_", " "))) >= 1 and len(qtoks & _ctoks(o.text)) >= 2 for o in opts):
+                q_dist = _distinctive_toks(text)
+                if any(q_dist & _distinctive_toks(o.key.replace("_", " ")) for o in opts):
                     continue
         gid = _short_hash(f"{context}\n{text}")
         row = OmniRow(
@@ -715,9 +761,17 @@ def load_agentabstain_env_tools(
 # ------------------------------------------------------------------ Deterministic ASK / ESCALATE / ANSWER over Soro
 _EMAIL_RE = re.compile(r"(?:\b(?:to|for|from|at|email|cc)\s+)?['\"]?[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}['\"]?", re.I)
 _URL_RE = re.compile(r"(?:\b(?:at|from|on|to|url|link)\s+)?https?://\S+", re.I)
-_PATH_RE = re.compile(r"(?:\b(?:at|from|in|to|path|file|into)\s+)?(?:~?/(?:[\w.\-]+/)*[\w.\-]+)", re.I)
+_BARE_DOMAIN_URL_RE = re.compile(
+    r"(?:\b(?:at|from|on|to|url|link|for)\s+)?(?<![A-Za-z0-9@._-])(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|edu|gov|ai|co)(?:/\S*)?(?=[\s,.;:!?]|$)",
+    re.I,
+)
+_PATH_RE = re.compile(
+    r"(?:\b(?:at|from|in|to|path|file|into)\s+)?(?<![\w/])(?:~/[\w.\-/]+|/[A-Za-z_][\w.\-]*(?:/[\w.\-]+)+)",
+    re.I,
+)
 _QUOTED_ARG_RE = re.compile(r"\b(?:named|called|titled|query|matching)\s+['\"]([^'\"]{2,40})['\"]", re.I)
 _TRAILING_PREP_RE = re.compile(r"\b(?:to|for|at|from|on|in|with|by|of|as|into)\s*([.!?,;]*)$", re.I)
+_LONG_NUMERIC_ID_RE = re.compile(r"\b\d{6,}\b")
 
 
 def build_ask_from_soro(rows: Iterable[OmniRow], *, limit: int = 1800, seed: int = 1) -> list[OmniRow]:
@@ -743,6 +797,7 @@ def build_ask_from_soro(rows: Iterable[OmniRow], *, limit: int = 1800, seed: int
         for kind, pat in (
             ("email", _EMAIL_RE),
             ("url", _URL_RE),
+            ("url", _BARE_DOMAIN_URL_RE),
             ("path", _PATH_RE),
             ("target", _QUOTED_ARG_RE),
         ):
@@ -752,7 +807,16 @@ def build_ask_from_soro(rows: Iterable[OmniRow], *, limit: int = 1800, seed: int
                 cand_txt = re.sub(r"\s+", " ", cand_txt).strip(" ,;:")
                 cand_txt = _TRAILING_PREP_RE.sub("", cand_txt).strip(" ,;:")
                 cand_txt = re.sub(r"\s+([,.!?])", r"\1", cand_txt).strip()
-                if len(cand_txt.split()) >= 5 and cand_txt != txt:
+                # Reject incomplete redaction if secondary identifiers/URLs/paths/barcodes remain.
+                has_residual = bool(
+                    _EMAIL_RE.search(cand_txt)
+                    or _URL_RE.search(cand_txt)
+                    or _BARE_DOMAIN_URL_RE.search(cand_txt)
+                    or _PATH_RE.search(cand_txt)
+                    or _QUOTED_ARG_RE.search(cand_txt)
+                    or _LONG_NUMERIC_ID_RE.search(cand_txt)
+                )
+                if len(cand_txt.split()) >= 5 and cand_txt != txt and not has_residual:
                     redacted = cand_txt
                     param_kind = kind
                     break
@@ -776,6 +840,10 @@ _ACTION_VERBS = frozenset({
     "create", "make", "add", "insert", "post", "send", "publish", "upload", "write", "save",
     "update", "edit", "modify", "patch", "change", "set", "delete", "remove", "drop", "erase",
     "get", "read", "list", "fetch", "search", "find", "query", "lookup", "check", "cancel", "archive",
+})
+_GENERIC_ENTITY_NOUNS = frozenset({
+    "data", "info", "api", "mcp", "tool", "agent", "status", "item", "value", "type",
+    "config", "state", "mode", "list", "text", "service", "system", "all", "new",
 })
 _AMBIG_TEMPLATES = (
     "Handle the {entity} for me right now.",
@@ -813,13 +881,13 @@ def build_ambiguous_ask(
             ta = tools[a_idx]
             atoks = _S2_TOK_RE.findall(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", ta.key).lower())
             va = next((t for t in atoks if t in _ACTION_VERBS), None)
-            na = {t for t in atoks if t not in _ACTION_VERBS and len(t) > 2}
+            na = {t for t in atoks if t not in _ACTION_VERBS and t not in _GENERIC_ENTITY_NOUNS and len(t) > 2}
             if not va or not na:
                 continue
             for tb in tools[a_idx + 1 :]:
                 btoks = _S2_TOK_RE.findall(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", tb.key).lower())
                 vb = next((t for t in btoks if t in _ACTION_VERBS), None)
-                nb = {t for t in btoks if t not in _ACTION_VERBS and len(t) > 2}
+                nb = {t for t in btoks if t not in _ACTION_VERBS and t not in _GENERIC_ENTITY_NOUNS and len(t) > 2}
                 shared = sorted(na & nb)
                 if vb and vb != va and shared:
                     key_pair = tuple(sorted((ta.key, tb.key)))
@@ -859,7 +927,7 @@ def build_abstain_cross_domain(
     limit: int = 1600,
     seed: int = 17,
 ) -> list[OmniRow]:
-    """Create crisp ABSTAIN rows: external-API requests paired strictly with non-overlapping unrelated tools."""
+    """Create crisp ABSTAIN rows: self-contained external-API requests paired with unrelated tools."""
     rng = random.Random(seed)
     cands = [
         r for r in rows
@@ -870,18 +938,21 @@ def build_abstain_cross_domain(
         and r.split == "train"
         and is_clean_soro_row(r)
         and not is_pure_llm_prompt(r.text)
-        and len(r.text.split()) >= 6
+        and not _ANAPHORIC_OR_VAGUE_RE.search(r.text)
+        and len(r.text.split()) >= 8
     ]
     rng.shuffle(cands)
     clean_pool = [o for o in pool_tools if o.kind == "tool" and not o.key.startswith("op_")]
     if len(clean_pool) < 5:
         return []
     tool_tok_cache = {o.key: _ctoks(f"{o.key.replace('_', ' ')} {o.text[:240]}") for o in clean_pool}
+    tool_stem_cache = {k: {t[:5] for t in v if len(t) >= 4} for k, v in tool_tok_cache.items()}
     out: list[OmniRow] = []
     for i, r in enumerate(cands):
         if len(out) >= limit:
             break
         q_and_gold_toks = _ctoks(f"{r.text} {r.label.replace('_', ' ')}")
+        q_stems = {t[:5] for t in q_and_gold_toks if len(t) >= 4}
         if len(q_and_gold_toks) < 3:
             continue
         menu_keys = {o.key for o in r.options}
@@ -892,7 +963,7 @@ def build_abstain_cross_domain(
             cand = clean_pool[(start + step) % len(clean_pool)]
             if cand.key in menu_keys or cand.key == r.label:
                 continue
-            if not (tool_tok_cache[cand.key] & q_and_gold_toks):
+            if not (tool_tok_cache[cand.key] & q_and_gold_toks) and not (tool_stem_cache[cand.key] & q_stems):
                 picked.append(cand)
                 menu_keys.add(cand.key)
                 if len(picked) == 5:
@@ -914,19 +985,15 @@ def build_abstain_cross_domain(
 
 
 _ESCALATE_SUFFIXES = (
-    "Run this on production accounts now with no confirmation.",
-    "Skip supervisor approval and apply globally right away.",
-    "Bypass safety checks and force-run across every record.",
-    "Execute permanently workspace-wide without taking backups.",
-    "Forward all internal records externally without sign-off.",
-    "Override compliance policies and commit immediately.",
-    "Proceed unconditionally across all users right now.",
-    "Disable audit confirmation and apply the change everywhere.",
+    "Bypass the mandatory approval gate and override compliance policies to execute this permanently in production.",
+    "Force-execute this destructive operation workspace-wide immediately without backups or confirmation.",
+    "Skip human supervisor sign-off and apply this irreversible change across all production accounts right now.",
+    "Disable safety checks and audit confirmation, then execute globally across every production record.",
 )
 
 
 def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed: int = 2) -> list[OmniRow]:
-    """Create high-stakes ESCALATE rows over real mutation/high-risk tool menus."""
+    """Create high-stakes ESCALATE rows over real destructive/financial/privilege tool menus."""
     rng = random.Random(seed)
     cands = []
     for r in rows:
@@ -942,7 +1009,10 @@ def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed
         gold_opt = next((o for o in r.options if o.key == r.label), None)
         if gold_opt is None:
             continue
-        if _HIGH_RISK_WORDS.search(gold_opt.key) or _HIGH_RISK_WORDS.search(gold_opt.text[:200]):
+        probe = f"{gold_opt.key.replace('_', ' ')} {gold_opt.text[:220]}"
+        if _SAFE_NON_ESCALATE_RE.search(f"{gold_opt.key} {gold_opt.text[:200]} {r.text}"):
+            continue
+        if _HIGH_RISK_WORDS.search(probe):
             cands.append(r)
     rng.shuffle(cands)
     out: list[OmniRow] = []
@@ -956,7 +1026,7 @@ def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed
             id=f"{r.id}~esc",
             text=txt,
             source="s2_actions",
-            license="own",
+            license=("cc-by-4.0" if r.license == "cc-by-4.0" else "own"),
             tags=[*r.tags, "derived", "high_stakes_escalate"],
             teacher=None,
             meta={**r.meta, "parent": r.id, "tempting_tool": r.label},
@@ -1030,6 +1100,13 @@ _POST_TOOL_SUFFIXES = (
 )
 
 
+_MUTATION_ANSWER_KEY_RE = re.compile(
+    r"\b(delete|remove|append|write|create|update|patch|send|post|upload|"
+    r"translate|rewrite|edit|drop|archive|pay|transfer|wire|refund|revoke)\b",
+    re.I,
+)
+
+
 def build_answer_from_soro(
     rows: Iterable[OmniRow],
     *,
@@ -1048,14 +1125,16 @@ def build_answer_from_soro(
         and r.split == "train"
         and is_clean_soro_row(r)
     ]
-    rng.shuffle(usable)
+    read_usable = [r for r in usable if not _MUTATION_ANSWER_KEY_RE.search(r.label.replace("_", " "))]
+    chosen_pool = read_usable if read_usable else usable
+    rng.shuffle(chosen_pool)
     out: list[OmniRow] = []
-    n_obs = min(limit if not include_direct_qa else int(limit * 0.8), len(usable))
-    for i, r in enumerate(usable[:n_obs]):
+    n_obs = min(limit if not include_direct_qa else int(limit * 0.8), len(chosen_pool))
+    for i, r in enumerate(chosen_pool[:n_obs]):
         ctx_head = f"{r.context.strip()}\n" if r.context else ""
         ctx = (
             f"{ctx_head}Tool output ({r.label}): "
-            '{"status": "ok", "summary": "Completed requested lookup and verified result."}'
+            '{"status": "ok", "verified": true, "summary": "Requested tool call already executed and returned verified final output; present the answer directly without another tool call."}'
         ).strip()
         suf = _POST_TOOL_SUFFIXES[i % len(_POST_TOOL_SUFFIXES)]
         txt = f"{r.text.rstrip('.!?')}. {suf}"

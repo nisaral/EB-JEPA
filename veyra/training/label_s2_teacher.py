@@ -25,42 +25,9 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "veyra" / "python" / "src"))
 sys.path.insert(0, str(REPO / "veyra" / "training"))
 
-from judge_s2_sample import S2TeacherJudge  # noqa: E402
+from judge_s2_sample import S2TeacherJudge, score_rows_batched  # noqa: E402
 from soro.omni_data import quality  # noqa: E402
 from soro.omni_data.schema import OmniRow, read_rows, write_rows  # noqa: E402
-
-
-def score_rows_batched(scorer: S2TeacherJudge, chunk: list[OmniRow]) -> list[dict[str, float]]:
-    """Score multiple OmniRows across all rotations in parallel on causal text LMs."""
-    if scorer.multimodal or len(chunk) <= 1:
-        return [scorer.probs(r) for r in chunk]
-    prompts: list[str] = []
-    spans: list[tuple[int, int, list[list[str]]]] = []
-    for r in chunk:
-        keys = [o.key for o in r.options]
-        k = max(1, min(scorer.rotations, len(keys)))
-        orders = [keys[s:] + keys[:s] for s in range(k)]
-        start = len(prompts)
-        for o in orders:
-            prompts.append(scorer._prompt_text(r, o))
-        spans.append((start, len(prompts), orders))
-
-    with torch.no_grad():
-        enc = scorer.tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(scorer.model.device)
-        last = scorer.model(**enc).logits[:, -1].float()
-
-    out_probs: list[dict[str, float]] = []
-    for r, (start, end, orders) in zip(chunk, spans):
-        keys = [o.key for o in r.options]
-        total = {k: 0.0 for k in keys}
-        k = len(orders)
-        for idx, order in enumerate(orders):
-            lg = last[start + idx, scorer.letter_ids[: len(order)]]
-            p = torch.softmax(lg / scorer.temperature, -1).cpu().tolist()
-            for key, val in zip(order, p):
-                total[key] += val / k
-        out_probs.append(total)
-    return out_probs
 
 
 def attach_teacher(row: OmniRow, probs: dict[str, float], model_id: str, rotations: int, temperature: float = 1.0) -> OmniRow:
