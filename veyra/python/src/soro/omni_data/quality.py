@@ -108,7 +108,7 @@ def dedupe(rows: list[OmniRow], near_threshold: float = 0.85, max_per_group_labe
         counts: Counter = Counter()
         capped = []
         for r in keep:
-            key = (r.package or r.source, r.label)
+            key = (r.group, r.label) if r.task == "ui_point" else (r.package or r.source, r.label)
             if counts[key] >= max_per_group_label:
                 stats["capped"] += 1
                 continue

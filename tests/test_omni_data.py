@@ -231,3 +231,16 @@ def test_build_keeps_verified_copy_of_unverified_row(tmp_path):
     build.build(cfg, tmp_path / "out")
     kept = [r for r in read_rows(tmp_path / "out" / "train.jsonl") if r.id == "1"]
     assert len(kept) == 1 and "teacher_verified" in kept[0].tags
+
+
+def test_dedupe_does_not_cap_distinct_ui_screens_on_generic_el_keys():
+    rows = []
+    for i in range(5):
+        opts = [Option("el0", "top-left"), Option("el1", "bottom-right"), special_option(ABSTAIN)]
+        rows.append(OmniRow(
+            id=f"ui-{i}", task="ui_point", modality="image", options=opts, label="el0",
+            source="os_atlas", license="apache-2.0", group=f"osa-screen-{i}",
+            text=f"Tap item {i}", image=f"/imgs/screen_{i}.png", package="os_atlas/aw_mobile",
+        ))
+    kept, stats = quality.dedupe(rows, max_per_group_label=2)
+    assert len(kept) == 5 and stats.get("capped", 0) == 0
