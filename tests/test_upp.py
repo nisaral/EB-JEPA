@@ -516,3 +516,28 @@ def test_s2_teacher_kl_init_ckpt_and_eval_ask_or_exact(tmp_path):
     summ = summarize_by_split(rows)["when2call"]
     assert "ask_or_exact" in summ and summ["ask_or_exact"] >= summ["acc"]
     assert "action:tool" in summ["subsets"] and "action:ask" in summ["subsets"]
+
+    # 4. label_s2_teacher shard merge & validation works end-to-end.
+    from label_s2_teacher import attach_teacher, merge_and_validate
+    from soro.omni_data.schema import OmniRow, Option, read_rows, write_rows
+
+    r1 = OmniRow(
+        id="lbl-1", task="tool_route", modality="text",
+        options=[Option("a", "tool a"), Option("__ask__", "ask", kind="special"), Option("__abstain__", "none", kind="special")],
+        label="a", source="soro_train", license="own", group="g1", text="run tool a on foo",
+    )
+    r2 = OmniRow(
+        id="lbl-2", task="tool_route", modality="text",
+        options=[Option("b", "tool b"), Option("__ask__", "ask", kind="special"), Option("__abstain__", "none", kind="special")],
+        label="__ask__", source="when2call", license="cc-by-4.0", group="g2", text="run tool b",
+    )
+    s0 = attach_teacher(r1, {"a": 0.9, "__ask__": 0.05, "__abstain__": 0.05}, "mock-teacher", rotations=4)
+    s1 = attach_teacher(r2, {"b": 0.9, "__ask__": 0.05, "__abstain__": 0.05}, "mock-teacher", rotations=4)
+    p0_path, p1_path = tmp_path / "sh0.jsonl", tmp_path / "sh1.jsonl"
+    write_rows([s0], p0_path)
+    write_rows([s1], p1_path)
+    merged_path = tmp_path / "merged_teacher.jsonl"
+    rep = merge_and_validate([p0_path, p1_path], merged_path)
+    assert rep["total"] == 2 and rep["teacher_coverage"] == 1.0
+    assert rep["label_audit"]["flagged"] == 1 and rep["label_audit"]["checked"] == 2
+    assert len(list(read_rows(merged_path))) == 2

@@ -729,7 +729,11 @@ def main() -> None:
 
     if getattr(args, "s2_data", ""):
         s2_dir = Path(args.s2_data)
-        train_all = read_jsonl(s2_dir / "s2_train.jsonl")
+        tr_file = s2_dir / "s2_train_teacher.jsonl"
+        if not tr_file.exists():
+            tr_file = s2_dir / "s2_train.jsonl"
+        print(f"loading S2 train from {tr_file.name}", flush=True)
+        train_all = read_jsonl(tr_file)
         selection = read_jsonl(s2_dir / "s2_selection.jsonl") if (s2_dir / "s2_selection.jsonl").exists() else []
         rng = random.Random(args.seed)
         rng.shuffle(train_all)
