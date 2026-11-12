@@ -1,4 +1,13 @@
-# Soro-Kev-Omni knowledge transfer (PLAN v4)
+# Soro-Kev-Omni knowledge transfer (Superseded by `NORTH_STAR.md` + `RESULTS_LEDGER.md`)
+
+> **ACTIVE LOOP (READ FIRST, UPDATED 2026-11-13):** S1 is **LOCKED (`s1_v3b_fp32`, `0/5,207` flips)**. Our strategic framing, literature delta vs **Drex (`arXiv:2611.07854`)** and October 2026 order-invariant preprints (`2610.01601`, `2610.18233`), and the **`G1`–`G5` Decision Models with Guarantees** roadmap now live in:
+> - **[`docs/NORTH_STAR.md`](NORTH_STAR.md)** — Active Thesis (`G1`–`G5`), Preprint/NeurIPS Ladder, and Execution Queue
+> - **[`docs/DREX_DELTA.md`](DREX_DELTA.md)** — Full Drex + Late-2026 Literature Delta & Public Benchmarks
+> - **[`docs/RESULTS_LEDGER.md`](RESULTS_LEDGER.md)** — Verified P0/S1/S2/S3 Runs & Baseline Comparisons
+
+---
+
+Historical PLAN v4 notes below (2026-11-12). Keep for reference only.
 
 Written **2026-11-12** for the next agent. Local folder: `C:\Users\nisar\OneDrive\Desktop\EB-JEPA`. GitHub: `nisaral/Soro-Boro`, branch **`upp-p0`**. HF user: **`nisaralll`**. Do not push to `main` unless the owner asks.
 

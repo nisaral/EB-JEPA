@@ -16,12 +16,12 @@ Rules:
 
 | Run ID | Stage | Config | Backbone | Seed | Commit | Steps | Eval dtype | `selection` (`n=120`) | `zeroshot` (`n=120`) | `flips` | Notes |
 | :-- | :-- | :-- | :-- | --: | :-- | --: | :-- | --: | --: | --: | :-- |
-| `p0_1k_A` | P0 | `query_first+dot` | `Qwen3.5-0.8B-Base` | `42` | `76e48f6` | `1000` | `fp16` | `0.858` (`103/120`, ref `0.750`) | `0.900` (`108/120`, ref `0.417`) | `5.0%` / `10.0%` | Query-first readout wins (`~2.7s/step` on T4) |
-| `p0_1k_L0` | P0 | `block+dot+gist4+late` | `Qwen3.5-0.8B-Base` | `42` | `76e48f6` | `1000` | `fp16` | `0.342` (`41/120`) | `0.408` (`49/120`) | `1.7%` / `0.8%` | Rejected (options blocked from query) |
-| `p0_1k_FX` | P0 | `block+dot+xattn` | `Qwen3.5-0.8B-Base` | `42` | `76e48f6` | `1000` | `fp16` | `0.250` (`30/120`) | `0.367` (`44/120`) | `0.8%` / `0.8%` | Rejected (cross-attn collapse on 1k steps) |
-| `s1_v1` | S1 | `query_first+dot` + shuffle KL + curriculum 4–64 | `Qwen3.5-0.8B-Base` | `42` | `ac98314` | `1000` | `fp16` | `0.875` (`105/120`, ref `0.750`) | `0.933` (`112/120`, ref `0.583`) | `5.0%` / `5.0%` | No checkpoint saved (`n=120` only) |
-| `s1_v2_n120` | S1 | `query_first+dot+noidx` (no opt idx + sym JSD) | `Qwen3.5-0.8B-Base` | `42` | `0b05f08` | `1000` | `fp16` | `0.858` (`103/120`, ref `0.813`) | `0.908` (`109/120`, ref `0.667`) | `3.3%` / `3.3%` | Saved `ckpt_A`; superseded by full `fp32` eval |
-| `s1_v3b_n120` | S1 | `query_first+dot+refiner+noidx+iso` | `Qwen3.5-0.8B-Base` | `42` | `37c4bf3` | `1000` | `fp16` | `0.850` (`102/120`, `flip=1/120`) | `0.917` (`110/120`, `flip=0/120`) | `0.8%` / `0.0%` | Saved `ckpt_A`; `1` flip on `n=120` was `fp16` quantization noise (`0` in `fp32`) |
+| `p0_1k_A` | P0 | `query_first+dot` | `Qwen3-0.6B-Base` | `42` | `76e48f6` | `1000` | `fp16` | `0.858` (`103/120`, ref `0.750`) | `0.900` (`108/120`, ref `0.417`) | `5.0%` / `10.0%` | Query-first readout wins (`~2.7s/step` on T4) |
+| `p0_1k_L0` | P0 | `block+dot+gist4+late` | `Qwen3-0.6B-Base` | `42` | `76e48f6` | `1000` | `fp16` | `0.342` (`41/120`) | `0.408` (`49/120`) | `1.7%` / `0.8%` | Rejected (options blocked from query) |
+| `p0_1k_FX` | P0 | `block+dot+xattn` | `Qwen3-0.6B-Base` | `42` | `76e48f6` | `1000` | `fp16` | `0.250` (`30/120`) | `0.367` (`44/120`) | `0.8%` / `0.8%` | Rejected (cross-attn collapse on 1k steps) |
+| `s1_v1` | S1 | `query_first+dot` + shuffle KL + curriculum 4–64 | `Qwen3-0.6B-Base` | `42` | `ac98314` | `1000` | `fp16` | `0.875` (`105/120`, ref `0.750`) | `0.933` (`112/120`, ref `0.583`) | `5.0%` / `5.0%` | No checkpoint saved (`n=120` only) |
+| `s1_v2_n120` | S1 | `query_first+dot+noidx` (no opt idx + sym JSD) | `Qwen3-0.6B-Base` | `42` | `0b05f08` | `1000` | `fp16` | `0.858` (`103/120`, ref `0.813`) | `0.908` (`109/120`, ref `0.667`) | `3.3%` / `3.3%` | Saved `ckpt_A`; superseded by full `fp32` eval |
+| `s1_v3b_n120` | S1 | `query_first+dot+refiner+noidx+iso` | `Qwen3-0.6B-Base` | `42` | `37c4bf3` | `1000` | `fp16` | `0.850` (`102/120`, `flip=1/120`) | `0.917` (`110/120`, `flip=0/120`) | `0.8%` / `0.0%` | Saved `ckpt_A`; `1` flip on `n=120` was `fp16` quantization noise (`0` in `fp32`) |
 
 ### S1 Full-Split `fp32` Lock Ladder (5 random orders per row, `n=5,207` total; `1` seed `42`)
 
@@ -61,10 +61,10 @@ Every comparison below is computed on **strictly identical row IDs**.
 | `cross_encoder` | `DeBERTa-v3-small` NLI | `0.2400` (`288/1200`) | `[0.217, 0.265]` | `0.1756` (`187/1065`) | `0.7481` (`101/135`) | `4.83 @ 90.3%` | `307.1` | — |
 | `bm25` | Lexical + fixed abstain τ | `0.5867` (`704/1200`) | `[0.559, 0.614]` | `0.6272` (`668/1065`) | `0.2667` (`36/135`) | `4.32 @ 84.1%` | `0.1` | — |
 | `dense_cosine` | MiniLM-L6 + fixed τ | `0.7917` (`950/1200`) | `[0.768, 0.814]` | `0.8451` (`900/1065`) | `0.3704` (`50/135`) | `1.54 @ 90.4%` | `33.0` | — |
-| `v2_fp32` | S1-UPP `0.8B` (joint menu) | `0.8383` (`1006/1200`) | `[0.816, 0.858]` | `0.8441` (`899/1065`) | `0.7926` (`107/135`) | `1.26 @ 90.2%` | — | `85/1200` (`7.1%`) |
-| `v3_fp32` | S1-UPP `0.8B` (isolated) | `0.8525` (`1023/1200`) | `[0.831, 0.871]` | `0.8545` (`910/1065`) | `0.8370` (`113/135`) | `1.20 @ 90.2%` | — | `0/1200` (`0.0%`) |
+| `v2_fp32` | S1-UPP `0.6B` (joint menu) | `0.8383` (`1006/1200`) | `[0.816, 0.858]` | `0.8441` (`899/1065`) | `0.7926` (`107/135`) | `1.26 @ 90.2%` | — | `85/1200` (`7.1%`) |
+| `v3_fp32` | S1-UPP `0.6B` (isolated) | `0.8525` (`1023/1200`) | `[0.831, 0.871]` | `0.8545` (`910/1065`) | `0.8370` (`113/135`) | `1.20 @ 90.2%` | — | `0/1200` (`0.0%`) |
 | `soro_0.8b` | Soro-Kev `0.8B` SFT | `0.8567` (`1028/1200`) | `[0.836, 0.875]` | `0.8695` (`926/1065`) | `0.7556` (`102/135`) | `1.14 @ 90.3%` | — | — |
-| **`v3b_fp32` (Ours)** | **S1-UPP `0.8B` (iso + refiner)** | **`0.8600` (`1032/1200`)** | **`[0.839, 0.878]`** | `0.8638` (`920/1065`) | **`0.8296` (`112/135`)** | **`1.13 @ 90.2%`** | — | **`0/1200` (`0.0%`)** |
+| **`v3b_fp32` (Ours)** | **S1-UPP `0.6B` (iso + refiner)** | **`0.8600` (`1032/1200`)** | **`[0.839, 0.878]`** | `0.8638` (`920/1065`) | **`0.8296` (`112/135`)** | **`1.13 @ 90.2%`** | — | **`0/1200` (`0.0%`)** |
 | `soro_4b` (ceiling) | Soro-Kev `4B` SFT | `0.9058` (`1087/1200`) | `[0.888, 0.921]` | `0.9052` (`964/1065`) | `0.9111` (`123/135`) | `1.01 @ 91.0%` | — | — |
 
 ### B. `BFCL v3` (`n=100`: `34` Multiple + `33` Live Multiple + `33` Irrelevance)
@@ -117,3 +117,16 @@ Bucketed all `84` rows in the S1 `near_miss` split (`v2` & `v3b` on identical ro
   - `26/84`: removed gold was a delexicalized alias (`op_XXXX`) of an identical lookalike still in the menu.
   - `3/84`: removed gold had a valid semantic synonym still present (`list_issues` vs `search_issues`).
 - **Action taken:** Purged the `29` wrong-gold twin rows in `stage_s2.py`; kept only the clean **`55`** `near_miss` rows in `eval_near_miss_s2.jsonl` as an **S2 abstain probe** (`__abstain__`), never scored as tool selection.
+
+---
+
+## 4. Drex (`arXiv:2611.07854`) Reference Numbers (For `G1`–`G3` Positioning)
+
+Published baselines from Dhankhar et al. (Nov 2026) — full analysis in [`docs/DREX_DELTA.md`](DREX_DELTA.md). Pending live `nace-ai/drex-v1.5` (`9B`, 4-bit T4) run on our exact `eval_external_s2`, `When2Call MCQ`, and `6–20` option slices.
+
+| Model | Params (Active/Total) | `When2Call` (DI `3,652` / AA) | Decision Bench v4 (`1,071`) | DecideBench Pair (`200`) | Perm Flips (All `1,591` / `K>=6` `173`) | ECE (`6–20` opt / Tools) | Speech / Conformal / Outcome Cards |
+| :--- | :--- | --: | --: | --: | --: | --: | :--- |
+| `Drex v1.5` | `9B / 9B` (Open) | `89.7` / `84.8` | `86.8%` | `80.5%` | `5.3%` / `15.6%` (`8.4%` rev) | `13.6%` / `10.1%` | None |
+| `Drex v2.0` | `3B / 35B` (Open) | `86.5` / `86.2` | `87.9%` | `93.5%` | `5.9%` / `16.2%` (`8.0%` rev) | `2.0%` / `5.0%` | None |
+| `Drex Max` | `27B / 27B` | `85.2` / `94.0` | `94.0%` | `97.0%` | `4.3%` / `13.3%` (`6.2%` rev) | `8.4%` / `9.2%` | Vision (`Max` only); no speech / CP / cards |
+| `S1-UPP v3b` (Ours) | **`0.6B`** | pending S2 eval | planned | planned | **`0.00%` (`0/5207`) / `0.00%` (`K>=6`)** | Conformal (`G2`) | `G1`–`G5` in execution (`docs/NORTH_STAR.md`) |
