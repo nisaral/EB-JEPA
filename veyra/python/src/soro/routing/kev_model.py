@@ -187,12 +187,14 @@ class SoroKevModel(nn.Module):
                     except Exception:
                         want_4bit = False
                 if not want_4bit:
-                    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                        load_kw["torch_dtype"] = torch.bfloat16
+                    if torch_dtype is not None:
+                        load_kw["dtype"] = torch_dtype
+                    elif torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                        load_kw["dtype"] = torch.bfloat16
                     elif torch.cuda.is_available():
-                        load_kw["torch_dtype"] = torch.float16
+                        load_kw["dtype"] = torch.float16
                     else:
-                        load_kw["torch_dtype"] = dtype
+                        load_kw["dtype"] = dtype
                 loaded = None
                 # Gemma 4's audio tower has no SDPA kernel: keep SDPA for text/vision, eager for audio.
                 mixed = {"text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"}
@@ -202,7 +204,18 @@ class SoroKevModel(nn.Module):
                             model_name, attn_implementation=attn_name, **load_kw
                         )
                         break
-                    except (TypeError, ValueError):
+                    except TypeError as exc:
+                        if "dtype" in str(exc) and "dtype" in load_kw:
+                            load_kw["torch_dtype"] = load_kw.pop("dtype")
+                            try:
+                                loaded = AutoModel.from_pretrained(
+                                    model_name, attn_implementation=attn_name, **load_kw
+                                )
+                                break
+                            except (TypeError, ValueError):
+                                continue
+                        continue
+                    except ValueError:
                         continue
                 if loaded is None:
                     loaded = AutoModel.from_pretrained(model_name, **load_kw)
