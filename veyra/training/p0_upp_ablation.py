@@ -127,6 +127,8 @@ def to_kev_record(r: dict[str, Any]) -> dict[str, Any] | None:
         "questions": {"tool_route": {"criteria": crit, "label": label}},
         "source": r.get("source"),
         "package": r.get("package"),
+        "tags": list(r.get("tags") or []),
+        "meta": dict(r.get("meta") or {}),
     }
 
 
@@ -467,9 +469,10 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
             batch = [_shrink_menu(r, k, rng_s1) for r in batch]
         amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
         out2 = None
+        need_perm_pass = s1 and not cfg.option_isolation
         with torch.autocast("cuda", dtype=amp_dtype, enabled=use_bf16 or use_fp16):
             out = model.forward_batch(batch, max_seq_len=args.max_seq_len)
-            if s1 and not out["skipped"]:
+            if need_perm_pass and not out["skipped"]:
                 if rng_s1.random() < args.rev_prob:
                     shuf = [_reverse_menu(r) for r in batch]
                 else:
@@ -479,7 +482,7 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
             skipped += 1
             continue
         loss = out["loss"]
-        if s1 and out2 is not None and not out2["skipped"]:
+        if need_perm_pass and out2 is not None and not out2["skipped"]:
             loss = 0.5 * (out["loss"] + out2["loss"]) + args.order_kl * _aligned_order_loss(
                 out["logits"], out["keys"], out2["logits"], out2["keys"], logit_weight=args.order_logit_w
             )
@@ -664,6 +667,8 @@ def main() -> None:
     ap.add_argument("--order-logit-w", type=float, default=0.15)
     ap.add_argument("--rev-prob", type=float, default=0.75)
     ap.add_argument("--keep-option-index", action="store_true", help="Keep [i] option prefix even under --s1.")
+    ap.add_argument("--isolate-options", action="store_true",
+                    help="S1 v3: mask option-to-option attention in query_first & share option start position (exact order invariance).")
     ap.add_argument("--save-ckpt", action="store_true", help="Save trained LoRA adapter and UPP head to --out/ckpt_<key>.")
     ap.add_argument("--k-min", type=int, default=4)
     ap.add_argument("--k-max", type=int, default=64)
@@ -689,10 +694,16 @@ def main() -> None:
     if zs_path is None:
         raise FileNotFoundError(f"No val_zeroshot.jsonl or test.jsonl under {data_dir}")
     zs = read_jsonl(zs_path)
-    stride = max(1, len(zs) // args.eval_rows)
+    if args.eval_rows > 0:
+        stride = max(1, len(zs) // args.eval_rows)
+        sel_eval = selection[: args.eval_rows]
+        zs_eval = zs[::stride][: args.eval_rows]
+    else:
+        sel_eval = selection
+        zs_eval = zs
     evals = {
-        "selection": selection[: args.eval_rows],
-        "zeroshot": zs[::stride][: args.eval_rows],
+        "selection": sel_eval,
+        "zeroshot": zs_eval,
         "bfcl": load_bfcl(),
     }
     toolret_stats = {}
@@ -744,6 +755,9 @@ def main() -> None:
         cfg = CONFIGS[key]
         if args.s1 and not getattr(args, "keep_option_index", False):
             cfg = replace(cfg, option_index=False)
+        if getattr(args, "isolate_options", False):
+            cfg = replace(cfg, option_index=(cfg.option_index and not args.s1 and getattr(args, "keep_option_index", False)),
+                          option_isolation=True)
         results[key] = train_one(key, cfg, args, train_rows, evals)
         if toolret_stats:
             results[key]["toolret_first_stage"] = toolret_stats

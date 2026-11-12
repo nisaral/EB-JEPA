@@ -97,6 +97,7 @@ class UPPConfig:
     # equivariant and the catalog cache is unchanged).
     readout: str = "vec"  # vec | xattn
     option_index: bool = True  # prepend "[i] " to options in non-block layouts
+    option_isolation: bool = False  # in query_first: mask option-to-option attn & share start position
 
     def name(self) -> str:
         parts = [self.layout, self.head]
@@ -122,6 +123,8 @@ class UPPConfig:
             parts.append(self.readout)
         if not self.option_index:
             parts.append("noidx")
+        if self.option_isolation:
+            parts.append("iso")
         return "+".join(parts)
 
 
@@ -337,9 +340,11 @@ class UPPModel(nn.Module):
         self.gist_emb = None
         if cfg.gists > 0:
             self.gist_emb = nn.Parameter(mean_emb.repeat(cfg.gists, 1) + 0.02 * torch.randn(cfg.gists, emb.shape[1]))
-        if cfg.layout == "block" and not self.is_mock and self._has_linear_attention():
+        if cfg.option_isolation and cfg.layout == "catalog_first":
+            raise ValueError("option_isolation is for layout='query_first' (layout='block' already isolates options)")
+        if (cfg.layout == "block" or cfg.option_isolation) and not self.is_mock and self._has_linear_attention():
             raise ValueError(
-                f"layout='block' needs full-attention layers; {model_name} has linear-attention "
+                f"layout='block' / option_isolation needs full-attention layers; {model_name} has linear-attention "
                 "(Gated DeltaNet) layers that cannot isolate blocks. Use Qwen3 or Gemma 4."
             )
 
@@ -516,12 +521,24 @@ class UPPModel(nn.Module):
             ids += self._tok("Options:\n")
             q_idx = len(ids) - 1
             req_idx = list(range(0, q_idx + 1))
-            for i, k in enumerate(keys):
-                start = len(ids)
-                ids += self._option_tokens(i, k, criteria[k], None)
-                opt_tokens.append(list(range(start, len(ids))))
+            if cfg.option_isolation:
+                p_opt = len(ids)
+                positions = list(range(p_opt))
+                blocks = [-1] * p_opt
+                for i, k in enumerate(keys):
+                    toks = self._option_tokens(i, k, criteria[k], None)
+                    start = len(ids)
+                    ids += toks
+                    positions += list(range(p_opt, p_opt + len(toks)))
+                    blocks += [i] * len(toks)
+                    opt_tokens.append(list(range(start, len(ids))))
+            else:
+                for i, k in enumerate(keys):
+                    start = len(ids)
+                    ids += self._option_tokens(i, k, criteria[k], None)
+                    opt_tokens.append(list(range(start, len(ids))))
+                positions = list(range(len(ids)))
             catalog_len = 0
-            positions = list(range(len(ids)))
         if cfg.gists:
             opt_idx = opt_gists
         elif cfg.option_pool == "last":
@@ -554,6 +571,20 @@ class UPPModel(nn.Module):
         else:  # full: every option token (and gists)
             req_sees = j_b >= 0
         allowed = causal & (same | to_prefix | (from_request & req_sees))
+        out = torch.zeros(L, L, dtype=torch.bool)
+        out[:n, :n] = allowed
+        idx = torch.arange(L)
+        out[idx, idx] = True
+        return out
+
+    def _query_iso_allowed(self, pk: dict[str, Any], L: int) -> torch.Tensor:
+        """(L, L) bool for query_first + option_isolation: options see prefix and themselves only."""
+        blocks = pk["blocks"]
+        n = len(blocks)
+        b = torch.tensor(blocks)
+        i_b, j_b = b.view(n, 1), b.view(1, n)
+        causal = torch.ones(n, n, dtype=torch.bool).tril()
+        allowed = causal & ((i_b == j_b) | (j_b == -1))
         out = torch.zeros(L, L, dtype=torch.bool)
         out[:n, :n] = allowed
         idx = torch.arange(L)
@@ -604,8 +635,8 @@ class UPPModel(nn.Module):
         embeds = torch.zeros(len(packs), L, emb_dim, device=device, dtype=dtype)
         positions = torch.zeros(len(packs), L, dtype=torch.long, device=device)
         tok_ids = torch.full((len(packs), L), self._pad_id(), dtype=torch.long, device=device)
-        block = self.cfg.layout == "block"
-        if block:
+        use_4d = self.cfg.layout == "block" or (self.cfg.layout == "query_first" and self.cfg.option_isolation)
+        if use_4d:
             neg = torch.finfo(dtype if dtype.is_floating_point else torch.float32).min
             mask = torch.full((len(packs), 1, L, L), neg, device=device, dtype=dtype)
         else:
@@ -617,8 +648,10 @@ class UPPModel(nn.Module):
             positions[b, :n] = torch.tensor(pk["positions"], device=device)
             if n < L:
                 positions[b, n:] = positions[b, n - 1] + 1
-            if block:
+            if self.cfg.layout == "block":
                 mask[b, 0][self._block_allowed(pk, L, mode).to(device)] = 0.0
+            elif use_4d:
+                mask[b, 0][self._query_iso_allowed(pk, L).to(device)] = 0.0
             else:
                 mask[b, :n] = 1
         return embeds, mask, positions, tok_ids
@@ -722,6 +755,38 @@ class UPPModel(nn.Module):
                 pe = F.softmax(lg, -1).float().cpu().tolist()
                 info["exits"].append({k: pe[i] for i, k in enumerate(pk["keys"])})
         return {k: p[i] for i, k in enumerate(pk["keys"])}, info
+
+    @torch.no_grad()
+    def batch_score(
+        self,
+        items: list[tuple[str, dict[str, str], Any]],
+        budget: int | None = None,
+        batch_size: int = 8,
+    ) -> list[tuple[dict[str, float], dict[str, Any]]]:
+        """Batched inference counterpart of ``score`` over (state, criteria, media) tuples."""
+        device = self._device
+        out: list[tuple[dict[str, float], dict[str, Any]]] = []
+        mode = self._mode()
+        for start in range(0, len(items), max(1, batch_size)):
+            chunk = items[start : start + max(1, batch_size)]
+            packs = [
+                self._with_budget(self.build(st, crit, media=self._resolve_media(med)), budget)
+                for st, crit, med in chunk
+            ]
+            embeds, mask, positions, tok_ids = self._batch(packs, device, mode)
+            h, exit_hs, _ = self._hidden(embeds, mask, positions, ids=tok_ids)
+            for b, pk in enumerate(packs):
+                logits, aux = self._score(h[b], pk)
+                p = F.softmax(logits, -1).float().cpu().tolist()
+                info: dict[str, Any] = {"u": float(aux["u"]), "energy": float(aux["energy"])}
+                if exit_hs:
+                    info["exits"] = []
+                    for hs in exit_hs:
+                        lg, _ = self._score(hs[b], pk)
+                        pe = F.softmax(lg, -1).float().cpu().tolist()
+                        info["exits"].append({k: pe[i] for i, k in enumerate(pk["keys"])})
+                out.append(({k: p[i] for i, k in enumerate(pk["keys"])}, info))
+        return out
 
     # ------------------------------------------------------------------ caching
     @staticmethod
@@ -877,3 +942,62 @@ class UPPModel(nn.Module):
 
     def config_dict(self) -> dict[str, Any]:
         return {"model_name": self.model_name, **asdict(self.cfg)}
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        ckpt_dir: Any,
+        use_mock: bool = False,
+        load_in_4bit: bool = False,
+        torch_dtype: torch.dtype | None = None,
+        media: bool = False,
+    ) -> "UPPModel":
+        from dataclasses import fields
+        from pathlib import Path
+
+        ckpt = Path(ckpt_dir)
+        try:
+            state = torch.load(ckpt / "head.pt", map_location="cpu", weights_only=True)
+        except Exception:
+            state = torch.load(ckpt / "head.pt", map_location="cpu", weights_only=False)
+        cfg_raw = dict(state["cfg"])
+        model_name = cfg_raw.pop("model_name", "Qwen/Qwen3-0.6B-Base")
+        valid_fields = {f.name for f in fields(UPPConfig)}
+        cfg_clean: dict[str, Any] = {}
+        for k, v in cfg_raw.items():
+            if k in valid_fields:
+                if k in ("exits", "gist_budgets") and isinstance(v, list):
+                    v = tuple(v)
+                cfg_clean[k] = v
+        model = cls(
+            UPPConfig(**cfg_clean),
+            model_name=model_name,
+            use_mock=use_mock,
+            load_in_4bit=load_in_4bit,
+            torch_dtype=torch_dtype,
+            media=media,
+        )
+        model.head.load_state_dict(state["head"])
+        if "pool" in state and model.pool is not None:
+            model.pool.load_state_dict(state["pool"])
+        if "slots" in state and model.slots is not None:
+            with torch.no_grad():
+                model.slots.copy_(state["slots"].to(model.slots.dtype))
+        if "gist_emb" in state and model.gist_emb is not None:
+            with torch.no_grad():
+                model.gist_emb.copy_(state["gist_emb"].to(model.gist_emb.dtype))
+        adapter_dir = ckpt / "adapter"
+        if not model.is_mock and adapter_dir.exists():
+            from peft import set_peft_model_state_dict
+
+            sf = adapter_dir / "adapter_model.safetensors"
+            if sf.exists():
+                from safetensors.torch import load_file
+
+                adapter_sd = load_file(str(sf))
+            else:
+                adapter_sd = torch.load(adapter_dir / "adapter_model.bin", map_location="cpu", weights_only=True)
+            res = set_peft_model_state_dict(model.backbone, adapter_sd)
+            if getattr(res, "unexpected_keys", None):
+                raise RuntimeError(f"Unexpected LoRA adapter keys: {res.unexpected_keys[:5]}")
+        return model

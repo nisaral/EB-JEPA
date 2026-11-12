@@ -265,3 +265,85 @@ def test_aligned_order_loss_penalizes_permutation_mismatch():
     # Both permutation passes receive gradients (non-detached symmetric JSD + centered-logit MSE).
     assert lg_a.grad is not None and float(lg_a.grad.abs().sum()) > 0
     assert lg_b_flip.grad is not None and float(lg_b_flip.grad.abs().sum()) > 0
+
+
+def test_query_first_option_isolation_exact_order_invariance_and_batch_score():
+    import random
+
+    torch.manual_seed(0)
+    m = UPPModel(
+        UPPConfig(layout="query_first", head="dot", option_index=False, option_isolation=True),
+        use_mock=True,
+    ).eval()
+    crit = {
+        "get_weather": "weather forecast for a city",
+        "send_email": "send an email message to recipient",
+        "search_files": "search local files by glob",
+        "__abstain__": "none of the listed tools fit",
+    }
+    pk = m.build(REC["state"], crit)
+    # All options must share the exact same start position right after q_idx, and mask out other options.
+    starts = [pk["positions"][t[0]] for t in pk["opt_tokens"]]
+    assert len(set(starts)) == 1 and starts[0] == pk["q_idx"] + 1
+    allowed = m._query_iso_allowed(pk, len(pk["ids"]))
+    assert allowed[pk["opt_tokens"][0][-1], : pk["q_idx"] + 1].all()
+    assert not allowed[pk["opt_tokens"][0][-1], pk["opt_tokens"][1][0]]
+    assert not allowed[pk["opt_tokens"][1][-1], pk["opt_tokens"][0][0]]
+
+    # Exact permutation invariance across 5 random menu orders + reversed order.
+    base_probs, _ = m.score(REC["state"], crit)
+    keys = list(crit)
+    rng = random.Random(123)
+    for _ in range(5):
+        perm = list(keys)
+        rng.shuffle(perm)
+        shuf_probs, _ = m.score(REC["state"], {k: crit[k] for k in perm})
+        assert max(abs(base_probs[k] - shuf_probs[k]) for k in keys) < 1e-5
+
+    # Batched scoring matches unbatched scoring even with different prompt lengths / right-padding.
+    crit2 = {"only_tool": "short", "__abstain__": "none"}
+    batched = m.batch_score([(REC["state"], crit, None), ("User Request: short ping", crit2, None)], batch_size=2)
+    p2, _ = m.score("User Request: short ping", crit2)
+    assert max(abs(batched[0][0][k] - base_probs[k]) for k in keys) < 1e-5
+    assert max(abs(batched[1][0][k] - p2[k]) for k in crit2) < 1e-5
+
+    # Gradient flows in training mode.
+    m.train()
+    out = m.forward_batch([REC, REC])
+    out["loss"].backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in m.trainable_parameters())
+
+
+def test_from_checkpoint_and_eval_upp_full_roundtrip(tmp_path):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "veyra" / "training"))
+    from eval_upp_full import _score_split_shard, summarize_by_split, wilson_ci
+
+    torch.manual_seed(0)
+    m = UPPModel(
+        UPPConfig(layout="query_first", head="dot", option_index=False, option_isolation=True),
+        use_mock=True,
+    ).eval()
+    ckpt = tmp_path / "ckpt_A"
+    ckpt.mkdir()
+    torch.save({"head": m.head.state_dict(), "cfg": m.config_dict()}, ckpt / "head.pt")
+
+    torch.manual_seed(0)
+    loaded = UPPModel.from_checkpoint(ckpt, use_mock=True).eval()
+    loaded.backbone.load_state_dict(m.backbone.state_dict())
+    assert loaded.cfg == m.cfg
+    p_orig, _ = m.score(REC["state"], REC["questions"]["tool_route"]["criteria"])
+    p_load, _ = loaded.score(REC["state"], REC["questions"]["tool_route"]["criteria"])
+    assert max(abs(p_orig[k] - p_load[k]) for k in p_orig) < 1e-6
+
+    lo, hi = wilson_ci(85, 100)
+    assert 0.76 < lo < 0.85 < hi < 0.92
+
+    row_col = dict(REC, id="r1", tags=["collision"])
+    row_nm = dict(REC, id="r2", tags=["near_miss"], questions={"tool_route": {"criteria": REC["questions"]["tool_route"]["criteria"], "label": "__abstain__"}})
+    scored = _score_split_shard(loaded, "zeroshot", [row_col, row_nm, REC, dict(REC, id="r4")], flip_orders=5, batch_size=2, seed=42, shard_idx=0, shard_total=1)
+    assert len(scored) == 4 and all(r["flipped"] == 0 for r in scored)
+    summary = summarize_by_split(scored)["zeroshot"]
+    assert summary["flip_rate"] == 0.0 and summary["subsets"]["collision"]["n"] == 1 and summary["subsets"]["near_miss"]["n"] == 1
