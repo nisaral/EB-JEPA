@@ -96,6 +96,7 @@ class UPPConfig:
     # in a small post-backbone head (options never see each other, so scores stay exactly order
     # equivariant and the catalog cache is unchanged).
     readout: str = "vec"  # vec | xattn
+    option_index: bool = True  # prepend "[i] " to options in non-block layouts
 
     def name(self) -> str:
         parts = [self.layout, self.head]
@@ -119,6 +120,8 @@ class UPPConfig:
             parts.append(f"pool-{self.option_pool}")
         if self.readout != "vec":
             parts.append(self.readout)
+        if not self.option_index:
+            parts.append("noidx")
         return "+".join(parts)
 
 
@@ -440,7 +443,7 @@ class UPPModel(nn.Module):
     # ------------------------------------------------------------------ layout
     def _option_tokens(self, i: int, key: str, text: str, budget: int | None) -> list[int]:
         body = f"{key}: {str(text)[: self.cfg.max_option_chars]}\n"
-        if self.cfg.layout != "block":
+        if self.cfg.layout != "block" and self.cfg.option_index:
             body = f"[{i}] " + body
         toks = self._tok(body)
         return toks[:budget] if budget is not None else toks

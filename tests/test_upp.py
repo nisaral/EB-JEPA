@@ -227,3 +227,41 @@ def test_xattn_readout_is_order_equivariant_and_trains_on_mock():
         p, _ = m.score(REC["state"], crit)
         q, _ = m.score(REC["state"], dict(reversed(list(crit.items()))))
         assert max(abs(p[k] - q[k]) for k in p) < 1e-5
+
+
+def test_option_index_false_removes_bracket_prefix():
+    with_idx = UPPModel(UPPConfig(layout="query_first", option_index=True), use_mock=True)
+    no_idx = UPPModel(UPPConfig(layout="query_first", option_index=False), use_mock=True)
+    crit = {"get_weather": "weather", "send_email": "email"}
+    pk_with = with_idx.build("User Request: hi", crit)
+    pk_no = no_idx.build("User Request: hi", crit)
+    assert len(pk_no["opt_tokens"][0]) < len(pk_with["opt_tokens"][0])
+    assert pk_no["q_idx"] == pk_with["q_idx"]
+    # Identical tool text produces identical token lengths regardless of position index.
+    pk_same = no_idx.build("User Request: hi", {"a": "same", "b": "same"})
+    assert len(pk_same["opt_tokens"][0]) == len(pk_same["opt_tokens"][1])
+
+
+def test_aligned_order_loss_penalizes_permutation_mismatch():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "veyra" / "training"))
+    from p0_upp_ablation import _aligned_order_loss, _reverse_menu
+
+    rev = _reverse_menu(REC)
+    assert list(rev["questions"]["tool_route"]["criteria"]) == list(reversed(list(REC["questions"]["tool_route"]["criteria"])))
+
+    keys_a = ["t1", "t2", "t3"]
+    keys_b = ["t3", "t2", "t1"]
+    lg_a = torch.tensor([2.0, 0.5, -1.0], requires_grad=True)
+    lg_b_match = torch.tensor([-1.0, 0.5, 2.0], requires_grad=True)
+    lg_b_flip = torch.tensor([2.0, 0.5, -1.0], requires_grad=True)
+    loss_same = _aligned_order_loss([lg_a], [keys_a], [lg_b_match], [keys_b], logit_weight=0.15)
+    loss_flip = _aligned_order_loss([lg_a], [keys_a], [lg_b_flip], [keys_b], logit_weight=0.15)
+    assert float(loss_same) < 1e-6
+    assert float(loss_flip) > 0.5
+    loss_flip.backward()
+    # Both permutation passes receive gradients (non-detached symmetric JSD + centered-logit MSE).
+    assert lg_a.grad is not None and float(lg_a.grad.abs().sum()) > 0
+    assert lg_b_flip.grad is not None and float(lg_b_flip.grad.abs().sum()) > 0

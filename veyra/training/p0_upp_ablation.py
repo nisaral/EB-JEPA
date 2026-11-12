@@ -39,6 +39,7 @@ import random
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -381,16 +382,36 @@ def _shuffle_menu(row: dict[str, Any], rng: random.Random) -> dict[str, Any]:
     return out
 
 
-def _aligned_kl(logits_a: list[torch.Tensor], keys_a: list[list[str]],
-                logits_b: list[torch.Tensor], keys_b: list[list[str]]) -> torch.Tensor:
+def _reverse_menu(row: dict[str, Any]) -> dict[str, Any]:
+    crit = dict(row["questions"]["tool_route"]["criteria"])
+    out = json.loads(json.dumps(row))
+    out["questions"]["tool_route"]["criteria"] = dict(reversed(list(crit.items())))
+    return out
+
+
+def _aligned_order_loss(
+    logits_a: list[torch.Tensor],
+    keys_a: list[list[str]],
+    logits_b: list[torch.Tensor],
+    keys_b: list[list[str]],
+    logit_weight: float = 0.15,
+) -> torch.Tensor:
+    """Symmetric JSD + centered-logit MSE between two permutations of the same rows."""
     terms = []
     for lg_a, ka, lg_b, kb in zip(logits_a, keys_a, logits_b, keys_b):
-        index = [kb.index(name) for name in ka if name in kb]
-        if len(index) < 2:
+        if len(ka) != len(kb) or set(ka) != set(kb) or len(ka) < 2:
             continue
-        pa = F.softmax(lg_a, dim=-1)
-        log_pb = F.log_softmax(lg_b[index], dim=-1)
-        terms.append(F.kl_div(log_pb, pa.detach(), reduction="sum"))
+        index = [kb.index(name) for name in ka]
+        la = lg_a.float()
+        lb = lg_b[index].float()
+        pa = F.softmax(la, dim=-1)
+        pb = F.softmax(lb, dim=-1)
+        log_pm = (0.5 * (pa + pb)).clamp_min(1e-9).log()
+        jsd = 0.5 * (F.kl_div(log_pm, pa, reduction="sum") + F.kl_div(log_pm, pb, reduction="sum"))
+        za = la - la.mean()
+        zb = lb - lb.mean()
+        lmse = ((za - zb) ** 2).mean()
+        terms.append(jsd + logit_weight * lmse)
     if not terms:
         return logits_a[0].sum() * 0.0
     return torch.stack(terms).mean()
@@ -425,9 +446,7 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
     params = model.trainable_parameters()
     n_train = sum(p.numel() for p in params)
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
-    steps = max(1, len(train_rows) // args.batch)
-    if getattr(args, "max_steps", 0):
-        steps = min(steps, args.max_steps)
+    steps = args.max_steps if getattr(args, "max_steps", 0) else max(1, len(train_rows) // args.batch)
     use_bf16 = bf16_ok
     use_fp16 = device == "cuda" and not bf16_ok and not four_bit
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
@@ -451,15 +470,18 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
         with torch.autocast("cuda", dtype=amp_dtype, enabled=use_bf16 or use_fp16):
             out = model.forward_batch(batch, max_seq_len=args.max_seq_len)
             if s1 and not out["skipped"]:
-                shuf = [_shuffle_menu(r, rng_s1) for r in batch]
+                if rng_s1.random() < args.rev_prob:
+                    shuf = [_reverse_menu(r) for r in batch]
+                else:
+                    shuf = [_shuffle_menu(r, rng_s1) for r in batch]
                 out2 = model.forward_batch(shuf, max_seq_len=args.max_seq_len)
         if out["skipped"]:
             skipped += 1
             continue
         loss = out["loss"]
         if s1 and out2 is not None and not out2["skipped"]:
-            loss = 0.5 * (out["loss"] + out2["loss"]) + args.order_kl * _aligned_kl(
-                out["logits"], out["keys"], out2["logits"], out2["keys"]
+            loss = 0.5 * (out["loss"] + out2["loss"]) + args.order_kl * _aligned_order_loss(
+                out["logits"], out["keys"], out2["logits"], out2["keys"], logit_weight=args.order_logit_w
             )
         scaler.scale(loss).backward()
         if scaler.is_enabled():
@@ -488,6 +510,23 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
             result["eval"][name] = {"skipped": "full-text layouts cannot read menus this large in one pass"}
             continue
         result["eval"][name] = evaluate(model, f"{key}/{name}", rows)
+    if getattr(args, "save_ckpt", False):
+        ckpt_dir = Path(args.out) / f"ckpt_{key}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        head_state = {
+            "head": model.head.state_dict(),
+            "cfg": model.config_dict(),
+        }
+        if model.pool is not None:
+            head_state["pool"] = model.pool.state_dict()
+        if model.slots is not None:
+            head_state["slots"] = model.slots.detach().cpu()
+        if model.gist_emb is not None:
+            head_state["gist_emb"] = model.gist_emb.detach().cpu()
+        torch.save(head_state, ckpt_dir / "head.pt")
+        if not model.is_mock and hasattr(model.backbone, "save_pretrained"):
+            model.backbone.save_pretrained(ckpt_dir / "adapter")
+        print(f"  saved checkpoint to {ckpt_dir}", flush=True)
     del model, opt
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -619,9 +658,13 @@ def main() -> None:
     ap.add_argument("--load-in-4bit", action="store_true")
     ap.add_argument("--no-grad-ckpt", action="store_true", help="Disable gradient checkpointing (faster, more VRAM)")
     ap.add_argument("--s1", action="store_true",
-                    help="Pointer-A S1: menu shuffle + order KL, curriculum 4-64, temperature floor.")
+                    help="Pointer-A S1: menu shuffle/reverse + symmetric order JSD/logit loss, curriculum 4-64, temp floor, no option index.")
     ap.add_argument("--temp-floor", type=float, default=0.05)
-    ap.add_argument("--order-kl", type=float, default=0.3)
+    ap.add_argument("--order-kl", type=float, default=1.0)
+    ap.add_argument("--order-logit-w", type=float, default=0.15)
+    ap.add_argument("--rev-prob", type=float, default=0.75)
+    ap.add_argument("--keep-option-index", action="store_true", help="Keep [i] option prefix even under --s1.")
+    ap.add_argument("--save-ckpt", action="store_true", help="Save trained LoRA adapter and UPP head to --out/ckpt_<key>.")
     ap.add_argument("--k-min", type=int, default=4)
     ap.add_argument("--k-max", type=int, default=64)
     ap.add_argument("--smoke", action="store_true", help="Tiny CPU run with a mock backbone")
@@ -698,7 +741,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     results: dict[str, Any] = {}
     for key in [k.strip() for k in args.configs.split(",") if k.strip()]:
-        results[key] = train_one(key, CONFIGS[key], args, train_rows, evals)
+        cfg = CONFIGS[key]
+        if args.s1 and not getattr(args, "keep_option_index", False):
+            cfg = replace(cfg, option_index=False)
+        results[key] = train_one(key, cfg, args, train_rows, evals)
         if toolret_stats:
             results[key]["toolret_first_stage"] = toolret_stats
         (out_dir / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
