@@ -547,3 +547,64 @@ def test_s2_teacher_kl_init_ckpt_and_eval_ask_or_exact(tmp_path):
     frows = list(read_rows(filtered_path))
     assert frep["kept"] == 1 and frep["dropped"] == 1
     assert [r.id for r in frows] == ["lbl-1"] and "probs" not in (frows[0].teacher or {})
+
+
+def test_eval_conformal_action_g2_g3():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "veyra" / "training"))
+    from eval_conformal_action import build_report, format_markdown, k_bucket, lac_quantile, set_as_action_predict
+
+    assert k_bucket(4) == "k_le_5" and k_bucket(6) == "k_6_20" and k_bucket(20) == "k_6_20" and k_bucket(25) == "k_gt_20"
+    assert abs(lac_quantile([0.1, 0.2, 0.3, 0.4, 0.5], 0.2) - 0.5) < 1e-9
+
+    # Set-as-action: |S_tool|=0 -> abstain, |S_tool|=1 -> act, |S_tool|>=2 -> ask
+    p_abs = {"t1": 0.25, "t2": 0.20, "__ask__": 0.15, "__abstain__": 0.35, "__answer__": 0.05}
+    p_act = {"t1": 0.85, "t2": 0.05, "__ask__": 0.05, "__abstain__": 0.03, "__answer__": 0.02}
+    p_ask = {"t1": 0.45, "t2": 0.42, "__ask__": 0.08, "__abstain__": 0.03, "__answer__": 0.02}
+    d_abs, s_abs = set_as_action_predict(p_abs, q_tool=0.65)  # needs p >= 0.35
+    d_act, s_act = set_as_action_predict(p_act, q_tool=0.65)
+    d_ask, s_ask = set_as_action_predict(p_ask, q_tool=0.65)
+    assert d_abs == "__abstain__" and s_abs == []
+    assert d_act == "t1" and s_act == ["t1"]
+    assert d_ask == "__ask__" and s_ask == ["t1", "t2"]
+
+    def _mk(split: str, idx: int, probs: dict[str, float], gold: str) -> dict:
+        top = max(probs, key=probs.get)
+        return {
+            "split": split,
+            "id": f"{split}-{idx}",
+            "gold": gold,
+            "gold_kind": "abstain" if gold == "__abstain__" else ("ask" if gold == "__ask__" else ("answer" if gold == "__answer__" else "tool")),
+            "top": top,
+            "ok": int(top == gold),
+            "flipped": 0,
+            "probs": probs,
+            "u": 0.1,
+        }
+
+    # Build 7-option (K in [6,20]) calibration + held-out eval rows
+    def _k7_probs(vals: dict[str, float]) -> dict[str, float]:
+        base = {f"t{i}": 0.01 for i in range(1, 5)}
+        base.update({"__ask__": 0.01, "__abstain__": 0.01, "__answer__": 0.01})
+        base.update(vals)
+        s = sum(base.values())
+        return {k: v / s for k, v in base.items()}
+
+    rows = []
+    for i in range(30):
+        rows.append(_mk("s2_selection", i, _k7_probs({"t1": 0.85}), "t1"))
+        rows.append(_mk("s2_selection", 100 + i, _k7_probs({"t1": 0.42, "t2": 0.40, "__ask__": 0.12}), "__ask__"))
+        rows.append(_mk("s2_selection", 200 + i, _k7_probs({"t1": 0.15, "__abstain__": 0.70}), "__abstain__"))
+    for i in range(24):
+        rows.append(_mk("when2call_mcq", i, _k7_probs({"t1": 0.85}), "t1"))
+        rows.append(_mk("when2call_mcq", 100 + i, _k7_probs({"t1": 0.42, "t2": 0.40, "__ask__": 0.12}), "__ask__"))
+        rows.append(_mk("when2call_mcq", 200 + i, _k7_probs({"t1": 0.15, "__abstain__": 0.70}), "__abstain__"))
+
+    rep = build_report(rows, cal_split="s2_selection")
+    assert "k_6_20" in rep["g2_k_buckets"]["when2call_mcq"]
+    assert rep["g2_conformal"]["by_alpha"]["0.10"]["splits"]["when2call_mcq"]["transfer_lac"]["coverage"] >= 0.85
+    assert rep["g3_set_as_action"]["tuned_tool_set"]["splits"]["when2call_mcq"]["acc"] >= 0.9
+    md = format_markdown(rep)
+    assert "G2 & G3 Evaluation" in md and "ALL_EVAL_K_6_20" in md
