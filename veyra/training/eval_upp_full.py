@@ -25,6 +25,8 @@ sys.path.insert(0, str(REPO / "veyra" / "python" / "src"))
 sys.path.insert(0, str(REPO / "veyra" / "training"))
 
 from p0_upp_ablation import auroc, conformal, ece, gold_key, is_correct, read_jsonl  # noqa: E402
+from soro.omni_data.s2_actions import action_kind  # noqa: E402
+from soro.omni_data.schema import ASK  # noqa: E402
 from soro.routing.upp import UPPModel  # noqa: E402
 
 
@@ -128,7 +130,10 @@ def _score_split_shard(
                     max_spread = spread
         top0 = max(probs0, key=probs0.get)
         ok = is_correct(r, top0)
+        ask_or_ok = bool(ok or (ASK in probs0 and top0 == ASK))
         g = gold_key(r, probs0)
+        g_kind = action_kind(g)
+        p_kind = action_kind(top0)
         tags = sorted(_row_tags(r))
         out_rows.append(
             {
@@ -136,8 +141,11 @@ def _score_split_shard(
                 "orig_idx": orig_idx,
                 "id": r.get("id"),
                 "gold": g,
+                "gold_kind": g_kind,
                 "top": top0,
+                "pred_kind": p_kind,
                 "ok": int(ok),
+                "ask_or_ok": int(ask_or_ok),
                 "abstain": int(g == "__abstain__"),
                 "collision": int("collision" in tags),
                 "near_miss": int("near_miss" in tags),
@@ -159,6 +167,9 @@ def summarize_scored_rows(rows: list[dict[str, Any]], include_conformal: bool = 
     acc_k = sum(hits)
     acc = acc_k / n
     acc_ci = wilson_ci(acc_k, n)
+    ask_ok_k = sum(int(r.get("ask_or_ok", r["ok"])) for r in rows)
+    ask_ok = ask_ok_k / n
+    ask_ok_ci = wilson_ci(ask_ok_k, n)
     flips_k = sum(int(r["flipped"]) for r in rows)
     flip_rate = flips_k / n
     flip_ci = wilson_ci(flips_k, n)
@@ -182,6 +193,9 @@ def summarize_scored_rows(rows: list[dict[str, Any]], include_conformal: bool = 
         "acc": acc,
         "acc_k": acc_k,
         "acc_ci95": list(acc_ci),
+        "ask_or_exact": ask_ok,
+        "ask_or_exact_k": ask_ok_k,
+        "ask_or_exact_ci95": list(ask_ok_ci),
         "nll": nll,
         "brier": brier,
         "ece": ece(confs, hits),
@@ -227,6 +241,10 @@ def summarize_by_split(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
         tool_rows = [r for r in srows if not r["abstain"]]
         if tool_rows:
             subsets["tool_call"] = summarize_scored_rows(tool_rows, include_conformal=False)
+        for act in ("tool", "ask", "abstain", "escalate", "answer"):
+            arows = [r for r in srows if r.get("gold_kind", action_kind(r["gold"])) == act]
+            if arows and len(arows) < len(srows):
+                subsets[f"action:{act}"] = summarize_scored_rows(arows, include_conformal=False)
         if subsets:
             entry["subsets"] = subsets
         summary[name] = entry
@@ -237,13 +255,15 @@ def format_markdown(summary: dict[str, Any], title: str = "Full Evaluation") -> 
     lines = [
         f"## {title}",
         "",
-        "| Split (slice) | n | Acc (95% CI) | NLL | Brier | ECE | Refusal (95% CI) | 5-Order Flips (95% CI) | LAC set @cov | Err-AUROC u |",
-        "| :-- | --: | --: | --: | --: | --: | --: | --: | --: | --: |",
+        "| Split (slice) | n | Acc (95% CI) | AskOrExact | NLL | Brier | ECE | Refusal (95% CI) | 5-Order Flips (95% CI) | LAC set @cov | Err-AUROC u |",
+        "| :-- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |",
     ]
 
     def _row_line(label: str, d: dict[str, Any]) -> str:
         ci = d.get("acc_ci95", [0.0, 0.0])
         acc_s = f"{d['acc']:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]"
+        aoe = d.get("ask_or_exact", d["acc"])
+        aoe_s = f"{aoe:.3f}"
         if d.get("refusal") is None:
             ref_s = "-"
         else:
@@ -255,7 +275,7 @@ def format_markdown(summary: dict[str, Any], title: str = "Full Evaluation") -> 
         lac_s = f"{lac['set_size']:.2f} @ {lac['coverage']:.3f}" if lac else "-"
         au = (d.get("error_auroc") or {}).get("u")
         au_s = f"{au:.3f}" if au is not None else "-"
-        return f"| {label} | {d['n']} | {acc_s} | {d['nll']:.3f} | {d['brier']:.4f} | {d['ece']:.3f} | {ref_s} | {flip_s} | {lac_s} | {au_s} |"
+        return f"| {label} | {d['n']} | {acc_s} | {aoe_s} | {d['nll']:.3f} | {d['brier']:.4f} | {d['ece']:.3f} | {ref_s} | {flip_s} | {lac_s} | {au_s} |"
 
     for split, d in summary.items():
         if d.get("n", 0) == 0:

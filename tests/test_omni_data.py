@@ -378,3 +378,91 @@ def test_s2_deterministic_builders_conformal_and_stage_smoke(tmp_path):
 
     rep = stage_s2._smoke_build(tmp_path)
     assert set(rep["train_classes"]) == {"tool", "abstain", "ask", "escalate", "answer"}
+
+
+def test_s2_clean_filters_schema_star_and_done_target():
+    from soro.omni_data.s2_actions import (
+        _format_tool_schema,
+        build_abstain_cross_domain,
+        build_ambiguous_ask,
+        from_when2call_pref,
+        wrap_s2_row,
+    )
+    from soro.omni_data.schema import ANSWER, ASK, ESCALATE
+
+    # Missing 'required' list falls back to 'optional' in type string (When2Call pref/sft format).
+    tool_no_req = {
+        "name": "send_msg",
+        "description": "Send message",
+        "parameters": {
+            "properties": {
+                "recipient": {"type": "string"},
+                "cc": {"type": "string, optional"},
+            }
+        },
+    }
+    sig = _format_tool_schema(tool_no_req)
+    assert "recipient*:string" in sig and "cc:string, optional" in sig and "cc*" not in sig
+
+    t_json = json.dumps(tool_no_req)
+    pref_clean_recs = [
+        # Real missing required param ASK (rejected tool uses 'recipient' not present in query)
+        {
+            "tools": [t_json],
+            "messages": [{"role": "user", "content": "Send a message right now"}],
+            "chosen_response": {"role": "assistant", "content": "Who should I send the message to?"},
+            "rejected_response": {"role": "assistant", "content": '<TOOLCALL>[{"name": "send_msg", "arguments": {"recipient": "Alice"}}]</TOOLCALL>'},
+        },
+        # False pagination ASK -> dropped under clean_s2=True
+        {
+            "tools": [t_json],
+            "messages": [{"role": "user", "content": "List messages"}],
+            "chosen_response": {"role": "assistant", "content": "Which page number would you like?"},
+            "rejected_response": {"role": "assistant", "content": '<TOOLCALL>[{"name": "send_msg", "arguments": {"recipient": "Bob"}}]</TOOLCALL>'},
+        },
+        # Pure LLM ABSTAIN -> dropped under clean_s2=True
+        {
+            "tools": [t_json],
+            "messages": [{"role": "user", "content": "Given [3, 1, 4, 2], find the largest 2 numbers."}],
+            "chosen_response": {"role": "assistant", "content": "Sorry, I cannot solve this."},
+            "rejected_response": {"role": "assistant", "content": '<TOOLCALL>[{"name": "missing_algo", "arguments": {}}]</TOOLCALL>'},
+        },
+    ]
+    cleaned = from_when2call_pref(pref_clean_recs, clean_s2=True)
+    assert len(cleaned) == 1 and cleaned[0].label == ASK
+
+    # Ambiguous multi-tool ASK & cross-domain ABSTAIN builders
+    r_amb = _row(
+        10,
+        "Manage the invoice database please now",
+        label="create_invoice",
+        tools=("create_invoice", "delete_invoice", "get_weather"),
+        pkg="fin",
+    )
+    amb = build_ambiguous_ask([r_amb], limit=5, seed=0)
+    assert len(amb) == 1 and amb[0].label == ASK and amb[0].validate() == []
+
+    r_xab = _row(
+        11,
+        "Check the flight departure status in Mumbai today",
+        label="get_flight_status",
+        tools=("get_flight_status", "book_hotel", "cancel_trip"),
+        pkg="travel",
+    )
+    unrelated_pool = [
+        Option("compile_shader", "Compile a GPU shader kernel"),
+        Option("prune_orchard", "Schedule apple orchard pruning"),
+        Option("tune_piano", "Record piano acoustic frequencies"),
+        Option("brew_espresso", "Control espresso boiler temperature"),
+        Option("calc_orbit", "Compute satellite orbital inclination"),
+    ]
+    xab = build_abstain_cross_domain([r_xab], unrelated_pool, limit=5, seed=0)
+    assert len(xab) == 1 and xab[0].label == ABSTAIN and "get_flight_status" not in {o.key for o in xab[0].options}
+
+    # wrap_s2_row strips __done__ from normal rows but keeps __done__ when target == "__done__" (zeroshot eval)
+    r_done_target = _row(12, "Thank you, everything looks complete!", label="__done__", tools=("__done__", "get_weather"))
+    s2_done = wrap_s2_row(r_done_target, shuffle_seed=0)
+    assert s2_done.label == "__done__" and "__done__" in {o.key for o in s2_done.options}
+    r_other_target = _row(13, "What is the weather today in Pune?", label="get_weather", tools=("__done__", "get_weather"))
+    s2_other = wrap_s2_row(r_other_target, shuffle_seed=0)
+    assert "__done__" not in {o.key for o in s2_other.options} and {ANSWER, ASK, ESCALATE, ABSTAIN} <= {o.key for o in s2_other.options}

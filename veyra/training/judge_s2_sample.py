@@ -29,11 +29,11 @@ from soro.omni_data.teacher import LETTERS, TeacherScorer  # noqa: E402
 S2_SYSTEM = (
     "You judge the single best next router decision for a user request given the Context, "
     "available tool schemas, and four action cards:\n"
-    "- __answer__: Reply directly without calling any tool (ONLY when tool output is already provided in Context or no listed tool is needed).\n"
-    "- __ask__: Ask the user a clarifying question BEFORE calling any tool (when a required parameter/target is missing or ambiguous).\n"
+    "- __answer__: Reply directly without calling any tool (when tool output is already provided in Context so the request is resolved, OR it is a general-knowledge, math, writing, or coding question needing no listed API tool).\n"
+    "- __ask__: Ask the user a clarifying question BEFORE calling any tool. Pick __ask__ when a matching tool IS listed AND either (a) a required parameter marked with * (like coord*, domain*, symbol*, is_id*, city*, date*) is missing or replaced by a vague placeholder (like 'the website', 'the topic', 'a certain word', 'the given image', 'the creator', 'the strain'), OR (b) two or more listed tools match equally and the user's intended operation is ambiguous. Never pick __ask__ if NO listed tool matches — pick __abstain__ instead.\n"
     "- __escalate__: Escalate to human/supervisor confirmation BEFORE acting (when the request asks for a high-risk/destructive mutation or approval-gate bypass).\n"
-    "- none of these / __abstain__: No listed tool fits the request and none of the above apply.\n"
-    "- Or pick the single matching tool key if the tool fits and all required parameters are present without unapproved high-risk flags.\n"
+    "- none of these / __abstain__: No listed tool fits the requested external capability and none of the above apply.\n"
+    "- Or pick the single matching tool key if one listed tool clearly fits the request and its required (*) parameters are provided without unapproved high-risk flags (for schemas without * markers, only choose __ask__ if an essential target like email/URL/file path/ID is blatantly missing).\n"
     "Answer with one option letter only."
 )
 
@@ -149,3 +149,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

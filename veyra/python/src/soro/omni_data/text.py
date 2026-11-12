@@ -33,6 +33,12 @@ def _name_tokens(name: str) -> set[str]:
     return set(_TOK.findall(spaced.lower()))
 
 
+_MOD_TOKENS = frozenset({
+    "research", "academic", "scholar", "scientific", "web", "online",
+    "api", "v1", "v2", "v3", "mcp",
+})
+
+
 def _desc_tokens(text: str) -> set[str]:
     return {t for t in _TOK.findall(text.lower()) if len(t) > 2}
 
@@ -80,8 +86,12 @@ class ToolPool:
         return 0.6 * jn + 0.4 * jd
 
     def same_tool(self, a: str, b: str) -> bool:
-        """True when b is almost surely the same tool as a (send_email vs send-email, copied descriptions)."""
-        if self._name.get(a) and self._name.get(a) == self._name.get(b):
+        """True when b is almost surely the same/synonym tool as a (send_email vs send-email, search_papers vs search_research_papers, copied descriptions)."""
+        na, nb = self._name.get(a, set()), self._name.get(b, set())
+        if na and na == nb:
+            return True
+        ca, cb = na - _MOD_TOKENS, nb - _MOD_TOKENS
+        if len(ca) >= 2 and ca == cb:
             return True
         da, db = self._desc.get(a, set()), self._desc.get(b, set())
         return bool(da and db) and len(da & db) / len(da | db) >= 0.8

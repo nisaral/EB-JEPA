@@ -190,7 +190,7 @@ def wrap_s2_row(
 ) -> OmniRow:
     """Ensure all 4 S2 action cards are in ``row.options`` and attach ``meta['s2']`` costs."""
     target = label if label is not None else row.label
-    tool_opts = [o for o in row.options if o.kind != "special"]
+    tool_opts = [o for o in row.options if o.kind != "special" and (o.key != "__done__" or o.key == target)]
     extra_specials = [o for o in row.options if o.kind == "special" and o.key not in ACTION_CARDS and o.key == target]
     cards = [s2_card_option(k) for k in ACTION_CARDS]
     opts = tool_opts + extra_specials + cards
@@ -210,6 +210,70 @@ def wrap_s2_row(
         "costs": costs,
     }
     return replace(row, options=opts, label=target, tags=tags, meta=meta)
+
+
+# ------------------------------------------------------------------ Shared S2 hygiene helpers
+_S2_TOK_RE = re.compile(r"[a-z0-9]+")
+_S2_STOP = frozenset({
+    "the", "and", "for", "with", "from", "into", "that", "this", "what", "when",
+    "where", "which", "how", "can", "you", "get", "fetch", "find", "list", "show",
+    "give", "using", "api", "data", "information", "details", "user", "please",
+    "make", "create", "check", "set", "all", "are", "was", "were", "have", "has",
+})
+_PURE_LLM_RE = re.compile(
+    r"(\[[^\]]*\d+[^\]]*\]|\b(largest|smallest)\s+\d+\s+numbers\b|\boccurrences\s+of\b|"
+    r"\bextract\s+terminology\b|\bsummarize\s+this\b|\brewrite\s+this\b|"
+    r"\bmaximum\s+sum\b|\bcontiguous\s+subarray\b|\bsudoku\b|\bpalindrome\b|"
+    r"\bfibonacci\b|\bprime\s+factor|\bcalculate\s+the\s+mean\b|\bsort\s+the\s+list\b)",
+    re.I,
+)
+_PAGINATION_ASK_RE = re.compile(
+    r"\b(page\s*number|which\s+page|\bpage\b|\bskip\b|how\s+many\s+.*skip|\boffset\b|"
+    r"\blimit\b|items\s+per\s+page|per\s+page|sort(?:ed|ing)?)\b",
+    re.I,
+)
+_W2C_VAGUE_Q_RE = re.compile(
+    r"\b(a certain|the given|the specific|the topic|the website|the company|the anime|"
+    r"the creator|the home team|a property|the property|the strain|the video|the song|"
+    r"the user|the domain|an email|the email|a file|the file|an image|the image)\b",
+    re.I,
+)
+_NOISY_CTX_MARKERS = (
+    "prior tool observation",
+    "reactive to the agent",
+    "service agent asks",
+    "if the agent says",
+    "extremely distraught",
+    "you do not accept",
+)
+
+
+def _ctoks(text: str) -> set[str]:
+    return {t for t in _S2_TOK_RE.findall((text or "").lower()) if len(t) > 2 and t not in _S2_STOP}
+
+
+def is_clean_soro_row(row: OmniRow, *, allow_op: bool = False, allow_val: bool = False) -> bool:
+    """Filter out multi-turn persona instructions, empty-observation retries, __done__, and synthetic VAL templates."""
+    if row.label == "__done__" or any(o.key == "__done__" for o in row.options):
+        return False
+    if row.id.startswith(("multi_", "seq_", "done_")):
+        return False
+    if not allow_op and row.label.startswith("op_"):
+        return False
+    if (row.package or "").lower().startswith("tau"):
+        return False
+    full = f"{row.context} {row.text}".lower()
+    if any(m in full for m in _NOISY_CTX_MARKERS):
+        return False
+    if not allow_val and "val-" in full:
+        return False
+    if len((row.text or "").split()) < 4:
+        return False
+    return True
+
+
+def is_pure_llm_prompt(text: str) -> bool:
+    return bool(_PURE_LLM_RE.search(text or ""))
 
 
 # ------------------------------------------------------------------ When2Call converters
@@ -232,12 +296,15 @@ def _format_tool_schema(tool: dict[str, Any]) -> str:
     desc = str(tool.get("description") or "").strip()
     params = tool.get("parameters") or {}
     props = params.get("properties") if isinstance(params, dict) else None
+    has_req_list = isinstance(params, dict) and ("required" in params)
     req = set(params.get("required") or []) if isinstance(params, dict) else set()
     arg_parts: list[str] = []
     if isinstance(props, dict):
         for pname, pspec in list(props.items())[:8]:
             ptype = pspec.get("type", "any") if isinstance(pspec, dict) else "any"
-            star = "*" if pname in req else ""
+            # When2Call pref/sft omit 'parameters.required' and mark optional args inside type='..., optional'.
+            is_req = (pname in req) if has_req_list else ("optional" not in str(ptype).lower())
+            star = "*" if is_req else ""
             arg_parts.append(f"{pname}{star}:{ptype}")
     if arg_parts:
         sig = f" [args: {', '.join(arg_parts)}]"
@@ -253,7 +320,7 @@ def _extract_when2call_options(tools_raw: Any) -> list[Option]:
         if not t or not t.get("name"):
             continue
         name = str(t["name"]).strip()
-        if not name or name in seen or name in SPECIAL:
+        if not name or name in seen or name in SPECIAL or name == "__done__":
             continue
         seen.add(name)
         opts.append(Option(key=name, text=_format_tool_schema(t), kind="tool"))
@@ -304,7 +371,85 @@ def _short_hash(text: str) -> str:
     return hashlib.sha1(" ".join((text or "").lower().split()).encode("utf-8")).hexdigest()[:16]
 
 
-def from_when2call_pref(records: Iterable[dict[str, Any]], *, split: str = "train") -> list[OmniRow]:
+def _parse_first_toolcall(content: str) -> tuple[str | None, dict[str, Any]]:
+    if "<TOOLCALL>" not in (content or ""):
+        return None, {}
+    m = re.search(r"<TOOLCALL>\s*(\[.*\])\s*(?:</TOOLCALL>)?", content, re.S)
+    if not m:
+        return None, {}
+    try:
+        calls = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None, {}
+    if not isinstance(calls, list) or not calls or not isinstance(calls[0], dict):
+        return None, {}
+    name = str(calls[0].get("name") or "").strip() or None
+    args = calls[0].get("arguments")
+    return name, (args if isinstance(args, dict) else {})
+
+
+def _w2c_clean_accept(
+    label: str,
+    text: str,
+    chosen_content: str,
+    rejected_content: str,
+    raw_tools: Any,
+    opts: list[Option],
+) -> bool:
+    """Strict quality filter for When2Call rows in S2 training/selection."""
+    parsed_tools = [t for item in (raw_tools or []) if (t := _parse_json_obj(item)) and t.get("name")]
+    tmap = {str(t["name"]).strip(): t for t in parsed_tools}
+    rj_name, rj_args = _parse_first_toolcall(rejected_content)
+
+    if label == ASK:
+        if _PAGINATION_ASK_RE.search(chosen_content):
+            return False
+        if rj_name and rj_name in tmap:
+            props = (tmap[rj_name].get("parameters") or {}).get("properties") or {}
+            req_list = (tmap[rj_name].get("parameters") or {}).get("required")
+            if isinstance(req_list, list) and "required" in (tmap[rj_name].get("parameters") or {}):
+                req_keys = [k for k in req_list if k in props]
+            else:
+                req_keys = [
+                    k for k, v in props.items()
+                    if isinstance(v, dict) and "optional" not in str(v.get("type", "")).lower()
+                ]
+            if not req_keys:
+                return False
+            q_low = text.lower()
+            return any((not str(rj_args.get(k, "")).strip()) or (str(rj_args.get(k, "")).strip().lower() not in q_low) for k in req_keys)
+        # Fallback when rejected_response was refusal/direct-answer: require vague placeholder + tool with required arg
+        has_req = any("*" in o.text for o in opts)
+        return bool(has_req and _W2C_VAGUE_Q_RE.search(text))
+
+    if label == ABSTAIN:
+        if is_pure_llm_prompt(text):
+            return False
+        if not rj_name or rj_name in tmap:
+            return False
+        rtoks = _ctoks(rj_name.replace("_", " "))
+        qtoks = _ctoks(text)
+        for t in parsed_tools:
+            nm = str(t.get("name") or "")
+            ttoks = _ctoks(nm.replace("_", " "))
+            dtoks = _ctoks(str(t.get("description") or ""))
+            if rtoks and ttoks and (len(rtoks & ttoks) / len(rtoks | ttoks)) >= 0.40:
+                return False
+            if len(qtoks & ttoks) >= 2:
+                return False
+            if rtoks and dtoks and len(rtoks & dtoks) >= 2 and len(qtoks & dtoks) >= 2:
+                return False
+        return True
+
+    return True
+
+
+def from_when2call_pref(
+    records: Iterable[dict[str, Any]],
+    *,
+    split: str = "train",
+    clean_s2: bool = False,
+) -> list[OmniRow]:
     out: list[OmniRow] = []
     for idx, rec in enumerate(records):
         opts = _extract_when2call_options(rec.get("tools"))
@@ -319,6 +464,11 @@ def from_when2call_pref(records: Iterable[dict[str, Any]], *, split: str = "trai
         label = _classify_when2call_response(content, {o.key for o in opts})
         if label is None:
             continue
+        if clean_s2:
+            rejected = rec.get("rejected_response")
+            rj_content = rejected.get("content", "") if isinstance(rejected, dict) else str(rejected or "")
+            if not _w2c_clean_accept(label, text, content, rj_content, rec.get("tools"), opts):
+                continue
         gid = _short_hash(f"{context}\n{text}")
         row = OmniRow(
             id=f"w2c-pref-{idx}",
@@ -345,6 +495,7 @@ def from_when2call_sft(
     split: str = "train",
     allowed_actions: tuple[str, ...] = (ASK, ABSTAIN),
     seed: int = 0,
+    clean_s2: bool = False,
 ) -> list[OmniRow]:
     out: list[OmniRow] = []
     allowed = set(allowed_actions)
@@ -355,12 +506,23 @@ def from_when2call_sft(
         msgs = list(rec.get("messages") or [])
         if not msgs or msgs[-1].get("role") != "assistant":
             continue
-        label = _classify_when2call_response(str(msgs[-1].get("content") or ""), {o.key for o in opts})
+        resp_content = str(msgs[-1].get("content") or "")
+        label = _classify_when2call_response(resp_content, {o.key for o in opts})
         if label not in allowed:
             continue
         context, text = _split_messages(msgs[:-1])
         if not text:
             continue
+        if clean_s2:
+            if label == ASK:
+                if _PAGINATION_ASK_RE.search(resp_content) or not (any("*" in o.text for o in opts) and _W2C_VAGUE_Q_RE.search(text)):
+                    continue
+            elif label == ABSTAIN:
+                if is_pure_llm_prompt(text):
+                    continue
+                qtoks = _ctoks(text)
+                if any(len(qtoks & _ctoks(o.key.replace("_", " "))) >= 1 and len(qtoks & _ctoks(o.text)) >= 2 for o in opts):
+                    continue
         gid = _short_hash(f"{context}\n{text}")
         row = OmniRow(
             id=f"w2c-sft-{idx}",
@@ -551,14 +713,15 @@ def load_agentabstain_env_tools(
 
 
 # ------------------------------------------------------------------ Deterministic ASK / ESCALATE / ANSWER over Soro
-_EMAIL_RE = re.compile(r"\b(?:to|for|from|at|email|cc)?\s*['\"]?[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}['\"]?", re.I)
-_URL_RE = re.compile(r"\b(?:at|from|on|url|link)?\s*https?://\S+", re.I)
-_PATH_RE = re.compile(r"\b(?:at|from|in|to|path|file)?\s*(?:~?/(?:[\w.\-]+/)*[\w.\-]+)", re.I)
-_QUOTED_ARG_RE = re.compile(r"(?:named|called|for|id|titled|query|matching)\s+['\"]([^'\"]{2,40})['\"]", re.I)
+_EMAIL_RE = re.compile(r"(?:\b(?:to|for|from|at|email|cc)\s+)?['\"]?[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}['\"]?", re.I)
+_URL_RE = re.compile(r"(?:\b(?:at|from|on|to|url|link)\s+)?https?://\S+", re.I)
+_PATH_RE = re.compile(r"(?:\b(?:at|from|in|to|path|file|into)\s+)?(?:~?/(?:[\w.\-]+/)*[\w.\-]+)", re.I)
+_QUOTED_ARG_RE = re.compile(r"\b(?:named|called|titled|query|matching)\s+['\"]([^'\"]{2,40})['\"]", re.I)
+_TRAILING_PREP_RE = re.compile(r"\b(?:to|for|at|from|on|in|with|by|of|as|into)\s*([.!?,;]*)$", re.I)
 
 
 def build_ask_from_soro(rows: Iterable[OmniRow], *, limit: int = 1800, seed: int = 1) -> list[OmniRow]:
-    """Create missing-critical-parameter ASK rows by redacting explicit targets from clean requests."""
+    """Create missing-critical-parameter ASK rows by cleanly redacting explicit targets from single-turn requests."""
     rng = random.Random(seed)
     cands = [
         r for r in rows
@@ -567,6 +730,7 @@ def build_ask_from_soro(rows: Iterable[OmniRow], *, limit: int = 1800, seed: int
         and "generic_request" not in r.tags
         and "needs_teacher" not in r.tags
         and r.split == "train"
+        and is_clean_soro_row(r)
     ]
     rng.shuffle(cands)
     out: list[OmniRow] = []
@@ -586,6 +750,8 @@ def build_ask_from_soro(rows: Iterable[OmniRow], *, limit: int = 1800, seed: int
             if m:
                 cand_txt = (txt[: m.start()] + " " + txt[m.end() :]).strip()
                 cand_txt = re.sub(r"\s+", " ", cand_txt).strip(" ,;:")
+                cand_txt = _TRAILING_PREP_RE.sub("", cand_txt).strip(" ,;:")
+                cand_txt = re.sub(r"\s+([,.!?])", r"\1", cand_txt).strip()
                 if len(cand_txt.split()) >= 5 and cand_txt != txt:
                     redacted = cand_txt
                     param_kind = kind
@@ -606,16 +772,94 @@ def build_ask_from_soro(rows: Iterable[OmniRow], *, limit: int = 1800, seed: int
     return out
 
 
-_ESCALATE_SUFFIXES = (
-    "Apply this to all accounts and records in production immediately without any confirmation step.",
-    "Bypass the approval gate and override compliance restrictions to execute this permanently.",
-    "Force-execute this destructive operation across the entire workspace without taking a backup.",
-    "Export all internal credentials and forward them externally right away without supervisor sign-off.",
+_ACTION_VERBS = frozenset({
+    "create", "make", "add", "insert", "post", "send", "publish", "upload", "write", "save",
+    "update", "edit", "modify", "patch", "change", "set", "delete", "remove", "drop", "erase",
+    "get", "read", "list", "fetch", "search", "find", "query", "lookup", "check", "cancel", "archive",
+})
+_AMBIG_TEMPLATES = (
+    "Handle the {entity} for me right now.",
+    "Process the {entity} now.",
+    "Go ahead and manage that {entity} request.",
+    "Take care of the {entity} in my workspace.",
+    "Can you take action on the {entity}?",
 )
 
 
-def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed: int = 2) -> list[OmniRow]:
-    """Create high-stakes ESCALATE rows over real mutation/high-risk tool menus."""
+def build_ambiguous_ask(
+    rows: Iterable[OmniRow],
+    *,
+    limit: int = 500,
+    seed: int = 11,
+) -> list[OmniRow]:
+    """Create equal-fit ambiguous ASK rows where 2 distinct tools in the menu operate differently on the same entity."""
+    rng = random.Random(seed)
+    cands = [
+        r for r in rows
+        if r.task == "tool_route"
+        and r.label not in SPECIAL
+        and r.split == "train"
+        and is_clean_soro_row(r)
+    ]
+    rng.shuffle(cands)
+    seen_pairs: set[tuple[str, str]] = set()
+    out: list[OmniRow] = []
+    for i, r in enumerate(cands):
+        if len(out) >= limit:
+            break
+        tools = [o for o in r.options if o.kind == "tool" and not o.key.startswith("op_")]
+        pair: tuple[Option, Option, str, str, str] | None = None
+        for a_idx in range(len(tools)):
+            ta = tools[a_idx]
+            atoks = _S2_TOK_RE.findall(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", ta.key).lower())
+            va = next((t for t in atoks if t in _ACTION_VERBS), None)
+            na = {t for t in atoks if t not in _ACTION_VERBS and len(t) > 2}
+            if not va or not na:
+                continue
+            for tb in tools[a_idx + 1 :]:
+                btoks = _S2_TOK_RE.findall(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", tb.key).lower())
+                vb = next((t for t in btoks if t in _ACTION_VERBS), None)
+                nb = {t for t in btoks if t not in _ACTION_VERBS and len(t) > 2}
+                shared = sorted(na & nb)
+                if vb and vb != va and shared:
+                    key_pair = tuple(sorted((ta.key, tb.key)))
+                    if key_pair not in seen_pairs:
+                        pair = (ta, tb, shared[-1], va, vb)
+                        seen_pairs.add(key_pair)
+                        break
+            if pair is not None:
+                break
+        if pair is None:
+            continue
+        ta, tb, entity, va, vb = pair
+        tmpl = _AMBIG_TEMPLATES[(len(out) + seed) % len(_AMBIG_TEMPLATES)]
+        txt = tmpl.format(entity=entity, v1=va, v2=vb)
+        distractors = [o for o in tools if o.key not in (ta.key, tb.key)][:3]
+        row = replace(
+            r,
+            id=f"{r.id}~ambask",
+            text=txt,
+            context="",
+            group=f"s2-amb-{_short_hash(f'{ta.key}:{tb.key}:{txt}')}",
+            options=[ta, tb, *distractors],
+            source="s2_actions",
+            license="own",
+            tags=[*r.tags, "derived", "ask_ambiguous_fit"],
+            teacher=None,
+            meta={**r.meta, "parent": r.id, "competing_tools": [ta.key, tb.key], "shared_entity": entity},
+        )
+        out.append(wrap_s2_row(row, label=ASK, shuffle_seed=seed + i))
+    return out
+
+
+def build_abstain_cross_domain(
+    rows: Iterable[OmniRow],
+    pool_tools: list[Option],
+    *,
+    limit: int = 1600,
+    seed: int = 17,
+) -> list[OmniRow]:
+    """Create crisp ABSTAIN rows: external-API requests paired strictly with non-overlapping unrelated tools."""
     rng = random.Random(seed)
     cands = [
         r for r in rows
@@ -624,8 +868,82 @@ def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed
         and "generic_request" not in r.tags
         and "needs_teacher" not in r.tags
         and r.split == "train"
-        and infer_risk_tier(r.options, r.label) == "high"
+        and is_clean_soro_row(r)
+        and not is_pure_llm_prompt(r.text)
+        and len(r.text.split()) >= 6
     ]
+    rng.shuffle(cands)
+    clean_pool = [o for o in pool_tools if o.kind == "tool" and not o.key.startswith("op_")]
+    if len(clean_pool) < 5:
+        return []
+    tool_tok_cache = {o.key: _ctoks(f"{o.key.replace('_', ' ')} {o.text[:240]}") for o in clean_pool}
+    out: list[OmniRow] = []
+    for i, r in enumerate(cands):
+        if len(out) >= limit:
+            break
+        q_and_gold_toks = _ctoks(f"{r.text} {r.label.replace('_', ' ')}")
+        if len(q_and_gold_toks) < 3:
+            continue
+        menu_keys = {o.key for o in r.options}
+        picked: list[Option] = []
+        # Deterministic probe stride so unrelated tools vary cleanly per row.
+        start = (i * 37 + seed) % len(clean_pool)
+        for step in range(min(len(clean_pool), 120)):
+            cand = clean_pool[(start + step) % len(clean_pool)]
+            if cand.key in menu_keys or cand.key == r.label:
+                continue
+            if not (tool_tok_cache[cand.key] & q_and_gold_toks):
+                picked.append(cand)
+                menu_keys.add(cand.key)
+                if len(picked) == 5:
+                    break
+        if len(picked) < 3:
+            continue
+        row = replace(
+            r,
+            id=f"{r.id}~xab",
+            options=picked,
+            source="s2_actions",
+            license="own",
+            tags=[*r.tags, "derived", "abstain_cross_domain"],
+            teacher=None,
+            meta={**r.meta, "parent": r.id, "removed_gold": r.label},
+        )
+        out.append(wrap_s2_row(row, label=ABSTAIN, shuffle_seed=seed + i))
+    return out
+
+
+_ESCALATE_SUFFIXES = (
+    "Run this on production accounts now with no confirmation.",
+    "Skip supervisor approval and apply globally right away.",
+    "Bypass safety checks and force-run across every record.",
+    "Execute permanently workspace-wide without taking backups.",
+    "Forward all internal records externally without sign-off.",
+    "Override compliance policies and commit immediately.",
+    "Proceed unconditionally across all users right now.",
+    "Disable audit confirmation and apply the change everywhere.",
+)
+
+
+def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed: int = 2) -> list[OmniRow]:
+    """Create high-stakes ESCALATE rows over real mutation/high-risk tool menus."""
+    rng = random.Random(seed)
+    cands = []
+    for r in rows:
+        if not (
+            r.task == "tool_route"
+            and r.label not in SPECIAL
+            and "generic_request" not in r.tags
+            and "needs_teacher" not in r.tags
+            and r.split == "train"
+            and is_clean_soro_row(r)
+        ):
+            continue
+        gold_opt = next((o for o in r.options if o.key == r.label), None)
+        if gold_opt is None:
+            continue
+        if _HIGH_RISK_WORDS.search(gold_opt.key) or _HIGH_RISK_WORDS.search(gold_opt.text[:200]):
+            cands.append(r)
     rng.shuffle(cands)
     out: list[OmniRow] = []
     for i, r in enumerate(cands):
@@ -702,6 +1020,16 @@ def _diverse_direct_qa_prompts(n: int, seed: int) -> list[str]:
     return prompts[:n]
 
 
+_POST_TOOL_SUFFIXES = (
+    "Use the verified tool result above to reply.",
+    "Tool finished; summarize the result for me.",
+    "Present the observed result directly.",
+    "Give the final answer from that output.",
+    "No extra tool call needed; state the answer.",
+    "Wrap up using the observation above.",
+)
+
+
 def build_answer_from_soro(
     rows: Iterable[OmniRow],
     *,
@@ -718,6 +1046,7 @@ def build_answer_from_soro(
         and "generic_request" not in r.tags
         and "needs_teacher" not in r.tags
         and r.split == "train"
+        and is_clean_soro_row(r)
     ]
     rng.shuffle(usable)
     out: list[OmniRow] = []
@@ -728,7 +1057,8 @@ def build_answer_from_soro(
             f"{ctx_head}Tool output ({r.label}): "
             '{"status": "ok", "summary": "Completed requested lookup and verified result."}'
         ).strip()
-        txt = f"{r.text.rstrip('.!?')}. The tool result is already provided above; present the final answer directly."
+        suf = _POST_TOOL_SUFFIXES[i % len(_POST_TOOL_SUFFIXES)]
+        txt = f"{r.text.rstrip('.!?')}. {suf}"
         row = replace(
             r,
             id=f"{r.id}~ans",

@@ -455,3 +455,64 @@ def test_compare_upp_eval_mcnemar_and_exact_pairing():
     col = stats["collisions"]
     assert col["n"] == 20 and col["n10_a_only"] == 10 and col["n01_b_only"] == 5 and abs(col["delta_pts"] - (-25.0)) < 1e-9
     assert col["flips_a"] == 1 and col["flips_b"] == 0
+
+
+def test_s2_teacher_kl_init_ckpt_and_eval_ask_or_exact(tmp_path):
+    import sys
+    from argparse import Namespace
+    from pathlib import Path
+
+    tr_dir = Path(__file__).resolve().parents[1] / "veyra" / "training"
+    if str(tr_dir) not in sys.path:
+        sys.path.insert(0, str(tr_dir))
+    from eval_upp_full import _score_split_shard, summarize_by_split
+    from p0_upp_ablation import train_one
+
+    # 1. teacher_kl_weight computes soft KL when teacher.probs present and cleanly skips when absent.
+    torch.manual_seed(0)
+    m = UPPModel(
+        UPPConfig(layout="query_first", head="dot", option_index=False, option_isolation=True,
+                  refiner=True, cost_weight=0.5, teacher_kl_weight=0.25),
+        use_mock=True,
+    ).train()
+    crit = {"get_weather": "weather", "send_email": "email", "__ask__": "ask", "__abstain__": "none"}
+    rec_teacher = {
+        "id": "t1",
+        "state": "User Request: weather in Pune",
+        "questions": {"tool_route": {"criteria": crit, "label": "get_weather"}},
+        "meta": {"s2": {"costs": {"get_weather": 0.0, "send_email": 1.0, "__ask__": 0.45, "__abstain__": 0.8}}},
+        "teacher": {"model": "mock", "probs": {"get_weather": 0.8, "__ask__": 0.15, "send_email": 0.03, "__abstain__": 0.02}},
+    }
+    rec_plain = {
+        "id": "t2",
+        "state": "User Request: unclear request",
+        "questions": {"tool_route": {"criteria": crit, "label": "__ask__"}},
+    }
+    out = m.forward_batch([rec_teacher, rec_plain])
+    assert not out["skipped"] and float(out["loss"]) > 0
+    out["loss"].backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in m.trainable_parameters())
+
+    # 2. --init-ckpt reloads checkpoint config/weights, applies S2 cost & teacher_kl, and saves ckpt_A.
+    ckpt_in = tmp_path / "s1_ckpt"
+    ckpt_in.mkdir()
+    torch.save({"head": m.head.state_dict(), "cfg": m.config_dict()}, ckpt_in / "head.pt")
+
+    out_dir = tmp_path / "s2_run"
+    args = Namespace(
+        base_model="mock", smoke=True, load_in_4bit=False, no_grad_ckpt=True,
+        init_ckpt=str(ckpt_in), lr=1e-3, max_steps=2, batch=2, max_seq_len=512,
+        seed=42, log_every=10, s1=False, save_ckpt=True, out=str(out_dir),
+    )
+    cfg = UPPConfig(layout="query_first", head="dot", option_index=False, option_isolation=True,
+                    refiner=True, cost_weight=0.5, teacher_kl_weight=0.25)
+    res = train_one("A", cfg, args, [rec_teacher, rec_plain], {"sel": [rec_teacher, rec_plain]})
+    assert (out_dir / "ckpt_A" / "head.pt").exists()
+    assert "sel" in res["eval"]
+
+    # 3. eval_upp_full tracks ask_or_exact and action:* breakdowns.
+    m.eval()
+    rows = _score_split_shard(m, "when2call", [rec_teacher, rec_plain], flip_orders=3, batch_size=2, seed=7, shard_idx=0, shard_total=1)
+    summ = summarize_by_split(rows)["when2call"]
+    assert "ask_or_exact" in summ and summ["ask_or_exact"] >= summ["acc"]
+    assert "action:tool" in summ["subsets"] and "action:ask" in summ["subsets"]

@@ -121,7 +121,7 @@ def to_kev_record(r: dict[str, Any]) -> dict[str, Any] | None:
     ctx = r.get("context") or ""
     text = r.get("text") or ""
     state = (f"Context: {ctx}\n" if ctx else "") + f"User Request: {text}"
-    return {
+    out: dict[str, Any] = {
         "id": r.get("id"),
         "state": state,
         "questions": {"tool_route": {"criteria": crit, "label": label}},
@@ -130,6 +130,9 @@ def to_kev_record(r: dict[str, Any]) -> dict[str, Any] | None:
         "tags": list(r.get("tags") or []),
         "meta": dict(r.get("meta") or {}),
     }
+    if r.get("teacher") is not None:
+        out["teacher"] = r.get("teacher")
+    return out
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -430,8 +433,40 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
     # T4 has no bf16. fp16 weights + AdamW without a scaler underflow, so keep fp32
     # master weights and run the forward under fp16 autocast with a GradScaler.
     dtype = None if (four_bit or bf16_ok or device == "cpu") else torch.float32
-    model = UPPModel(cfg, model_name=args.base_model, use_mock=args.smoke,
-                     load_in_4bit=four_bit, torch_dtype=dtype, media=bool(getattr(args, "media", False)))
+    init_ckpt = getattr(args, "init_ckpt", "")
+    if init_ckpt:
+        model = UPPModel.from_checkpoint(
+            init_ckpt,
+            use_mock=args.smoke,
+            load_in_4bit=four_bit,
+            torch_dtype=dtype,
+            media=bool(getattr(args, "media", False)),
+        )
+        upd_cfg = model.cfg
+        if getattr(args, "s2_cost_weight", 0.0) > 0:
+            upd_cfg = replace(upd_cfg, cost_weight=float(args.s2_cost_weight))
+        if getattr(args, "teacher_kl", 0.0) > 0:
+            upd_cfg = replace(upd_cfg, teacher_kl_weight=float(args.teacher_kl))
+        model.cfg = upd_cfg
+        cfg = upd_cfg
+        if hasattr(model.head, "cfg"):
+            model.head.cfg = upd_cfg
+        for mem in getattr(model.head, "members", []):
+            mem.cfg = upd_cfg
+        if not model.is_mock:
+            for name, p in model.backbone.named_parameters():
+                if "lora_" in name:
+                    p.requires_grad_(True)
+        for mod in (model.head, model.pool):
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad_(True)
+        for ten in (model.slots, model.gist_emb):
+            if ten is not None:
+                ten.requires_grad_(True)
+    else:
+        model = UPPModel(cfg, model_name=args.base_model, use_mock=args.smoke,
+                         load_in_4bit=four_bit, torch_dtype=dtype, media=bool(getattr(args, "media", False)))
     if dtype is torch.float32 and not model.is_mock:
         model.backbone.float()
     if not model.is_mock and hasattr(model.backbone, "enable_input_require_grads"):
@@ -676,6 +711,10 @@ def main() -> None:
     ap.add_argument("--s2-data", default="", help="Optional S2 directory with s2_train.jsonl / s2_selection.jsonl / eval_*.jsonl.")
     ap.add_argument("--s2-cost-weight", type=float, default=0.0,
                     help="S2 exact expected asymmetric action cost weight (0 = disabled).")
+    ap.add_argument("--teacher-kl", type=float, default=0.0,
+                    help="Optional soft-label KL weight against row teacher.probs (0 = disabled).")
+    ap.add_argument("--init-ckpt", default="",
+                    help="Optional saved UPP checkpoint dir (head.pt + adapter/) to initialize S2 training from locked S1.")
     ap.add_argument("--save-ckpt", action="store_true", help="Save trained LoRA adapter and UPP head to --out/ckpt_<key>.")
     ap.add_argument("--k-min", type=int, default=4)
     ap.add_argument("--k-max", type=int, default=64)
@@ -699,6 +738,8 @@ def main() -> None:
         for ename, fname in (
             ("zeroshot", "eval_zeroshot_s2.jsonl"),
             ("external", "eval_external_s2.jsonl"),
+            ("collisions", "eval_collisions_s2.jsonl"),
+            ("near_miss", "eval_near_miss_s2.jsonl"),
             ("when2call", "eval_when2call_mcq.jsonl"),
             ("agentabstain", "eval_agentabstain.jsonl"),
         ):
@@ -788,6 +829,8 @@ def main() -> None:
             cfg = replace(cfg, refiner=True, refiner_layers=int(getattr(args, "refiner_layers", 1)))
         if getattr(args, "s2_cost_weight", 0.0) > 0:
             cfg = replace(cfg, cost_weight=float(args.s2_cost_weight))
+        if getattr(args, "teacher_kl", 0.0) > 0:
+            cfg = replace(cfg, teacher_kl_weight=float(args.teacher_kl))
         results[key] = train_one(key, cfg, args, train_rows, evals)
         if toolret_stats:
             results[key]["toolret_first_stage"] = toolret_stats
