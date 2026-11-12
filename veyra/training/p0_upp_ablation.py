@@ -44,6 +44,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "veyra" / "python" / "src"))
@@ -349,6 +350,52 @@ def evaluate(model: UPPModel, name: str, rows: list[dict[str, Any]], timing_rows
     return out
 
 
+def _curriculum_k(step: int, steps: int, k_min: int, k_max: int) -> int:
+    t = step / max(steps - 1, 1)
+    return max(k_min, min(k_max, int(round(k_min + t * (k_max - k_min)))))
+
+
+def _shrink_menu(row: dict[str, Any], k: int, rng: random.Random) -> dict[str, Any]:
+    q = row["questions"]["tool_route"]
+    crit = dict(q["criteria"])
+    gold = q["label"]
+    keep = [gold]
+    if "__abstain__" in crit and gold != "__abstain__":
+        keep.append("__abstain__")
+    rest = [name for name in crit if name not in keep]
+    gtoks = set(gold.lower().replace("-", "_").split("_"))
+    rest.sort(key=lambda name: -len(gtoks & set(name.lower().replace("-", "_").split("_"))))
+    keep.extend(rest[: max(0, k - len(keep))])
+    rng.shuffle(keep)
+    out = json.loads(json.dumps(row))
+    out["questions"]["tool_route"]["criteria"] = {name: crit[name] for name in keep if name in crit}
+    return out
+
+
+def _shuffle_menu(row: dict[str, Any], rng: random.Random) -> dict[str, Any]:
+    crit = dict(row["questions"]["tool_route"]["criteria"])
+    keys = list(crit)
+    rng.shuffle(keys)
+    out = json.loads(json.dumps(row))
+    out["questions"]["tool_route"]["criteria"] = {name: crit[name] for name in keys}
+    return out
+
+
+def _aligned_kl(logits_a: list[torch.Tensor], keys_a: list[list[str]],
+                logits_b: list[torch.Tensor], keys_b: list[list[str]]) -> torch.Tensor:
+    terms = []
+    for lg_a, ka, lg_b, kb in zip(logits_a, keys_a, logits_b, keys_b):
+        index = [kb.index(name) for name in ka if name in kb]
+        if len(index) < 2:
+            continue
+        pa = F.softmax(lg_a, dim=-1)
+        log_pb = F.log_softmax(lg_b[index], dim=-1)
+        terms.append(F.kl_div(log_pb, pa.detach(), reduction="sum"))
+    if not terms:
+        return logits_a[0].sum() * 0.0
+    return torch.stack(terms).mean()
+
+
 def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: list[dict[str, Any]],
               evals: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     torch.manual_seed(args.seed)
@@ -389,24 +436,42 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
     t0 = time.time()
     run_loss = run_acc = 0.0
     run_n = skipped = 0
+    s1 = bool(getattr(args, "s1", False))
+    rng_s1 = random.Random(args.seed + 7)
     for step in range(steps):
         for pg in opt.param_groups:
             pg["lr"] = get_cosine_lr(step, steps, max(1, steps // 20), args.lr)
-        batch = train_rows[step * args.batch:(step + 1) * args.batch]
+        start = (step * args.batch) % max(len(train_rows), 1)
+        batch = [train_rows[(start + i) % len(train_rows)] for i in range(args.batch)]
+        if s1:
+            k = _curriculum_k(step, steps, args.k_min, args.k_max)
+            batch = [_shrink_menu(r, k, rng_s1) for r in batch]
         amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+        out2 = None
         with torch.autocast("cuda", dtype=amp_dtype, enabled=use_bf16 or use_fp16):
             out = model.forward_batch(batch, max_seq_len=args.max_seq_len)
+            if s1 and not out["skipped"]:
+                shuf = [_shuffle_menu(r, rng_s1) for r in batch]
+                out2 = model.forward_batch(shuf, max_seq_len=args.max_seq_len)
         if out["skipped"]:
             skipped += 1
             continue
-        scaler.scale(out["loss"]).backward()
+        loss = out["loss"]
+        if s1 and out2 is not None and not out2["skipped"]:
+            loss = 0.5 * (out["loss"] + out2["loss"]) + args.order_kl * _aligned_kl(
+                out["logits"], out["keys"], out2["logits"], out2["keys"]
+            )
+        scaler.scale(loss).backward()
         if scaler.is_enabled():
             scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         scaler.step(opt)
         scaler.update()
         opt.zero_grad(set_to_none=True)
-        run_loss += float(out["loss"].detach())
+        if s1 and hasattr(model.head, "log_temp"):
+            with torch.no_grad():
+                model.head.log_temp.clamp_(min=math.log(max(args.temp_floor, 1e-4)))
+        run_loss += float(loss.detach())
         run_acc += out["acc"]
         run_n += 1
         if run_n and (step + 1) % args.log_every == 0:
@@ -553,12 +618,20 @@ def main() -> None:
     ap.add_argument("--toolret-large-n", type=int, default=300, help="Queries in the large-menu ToolRet split")
     ap.add_argument("--load-in-4bit", action="store_true")
     ap.add_argument("--no-grad-ckpt", action="store_true", help="Disable gradient checkpointing (faster, more VRAM)")
+    ap.add_argument("--s1", action="store_true",
+                    help="Pointer-A S1: menu shuffle + order KL, curriculum 4-64, temperature floor.")
+    ap.add_argument("--temp-floor", type=float, default=0.05)
+    ap.add_argument("--order-kl", type=float, default=0.3)
+    ap.add_argument("--k-min", type=int, default=4)
+    ap.add_argument("--k-max", type=int, default=64)
     ap.add_argument("--smoke", action="store_true", help="Tiny CPU run with a mock backbone")
     ap.add_argument("--media", action="store_true", help="Keep the omni backbone's audio/vision towers")
     ap.add_argument("--media-rows", default="", help="Comma-separated omni jsonl files with audio/image rows")
     ap.add_argument("--media-root", default=None, help="Where the rows' wav/png files live now (searched by name)")
     ap.add_argument("--media-train", type=int, default=2000, help="Media rows mixed into training (0 = eval only)")
     args = ap.parse_args()
+    if args.s1:
+        args.configs = "A"
 
     data_dir = resolve_data_dir(args.data_dir)
     train_all = read_jsonl(data_dir / "train.jsonl")

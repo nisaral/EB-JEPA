@@ -685,7 +685,7 @@ class UPPModel(nn.Module):
         loss = torch.stack(losses).sum() / len(packs)
         acc = sum(int(torch.argmax(lg).item() == g) for lg, g in zip(logits_out, golds)) / len(golds)
         return {"loss": loss, "skipped": False, "logits": logits_out, "kept": len(packs), "acc": acc,
-                "u": sum(us) / len(us)}
+                "u": sum(us) / len(us), "keys": [pk["keys"] for pk in packs]}
 
     def _row_loss(self, logits: torch.Tensor, aux: dict[str, torch.Tensor], g: int) -> torch.Tensor:
         p = F.softmax(logits, -1)
