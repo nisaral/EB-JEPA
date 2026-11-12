@@ -53,6 +53,7 @@ multimodal backbone (Gemma 4 E2B) is plugged in.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 from dataclasses import asdict, dataclass, field
@@ -72,6 +73,7 @@ class UPPConfig:
     layout: str = "query_first"  # query_first | catalog_first | block
     head: str = "dot"  # dot | gauss | rbf
     refiner: bool = False
+    refiner_layers: int = 1
     ensemble: int = 1
     exits: tuple[float, ...] = field(default_factory=tuple)  # e.g. (0.5, 0.75)
     think_slots: int = 0
@@ -103,7 +105,7 @@ class UPPConfig:
     def name(self) -> str:
         parts = [self.layout, self.head]
         if self.refiner:
-            parts.append("refiner")
+            parts.append("refiner" if self.refiner_layers == 1 else f"refiner{self.refiner_layers}")
         if self.ensemble > 1:
             parts.append(f"ens{self.ensemble}")
         if self.exits:
@@ -149,7 +151,11 @@ class _Member(nn.Module):
             layer = nn.TransformerEncoderLayer(
                 d_model=p, nhead=4, dim_feedforward=2 * p, dropout=0.0, batch_first=True, norm_first=True
             )
-            self.refiner = nn.TransformerEncoder(layer, num_layers=2, enable_nested_tensor=False)
+            self.refiner = nn.TransformerEncoder(
+                layer, num_layers=max(1, cfg.refiner_layers), enable_nested_tensor=False
+            )
+            self.ref_norm = nn.LayerNorm(p)
+            self.ref_gate = nn.Parameter(torch.tensor(0.1))
         if cfg.head == "gauss":
             self.q_logvar, self.k_logvar = nn.Linear(p, p), nn.Linear(p, p)
             for lin in (self.q_logvar, self.k_logvar):
@@ -164,9 +170,12 @@ class _Member(nn.Module):
     def forward(self, hq: torch.Tensor, hk: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         q, k = self.q_in(hq.unsqueeze(0)), self.k_in(hk)
         if self.refiner is not None:
-            tokens = torch.cat([q + self.type_emb[0], k + self.type_emb[1]], dim=0).unsqueeze(0)
-            out = self.refiner(tokens).squeeze(0)
-            q, k = out[:1], out[1:]
+            ctx = torch.amp.autocast("cuda", enabled=False) if q.is_cuda else contextlib.nullcontext()
+            with ctx:
+                tokens = torch.cat([q.float() + self.type_emb[0], k.float() + self.type_emb[1]], dim=0).unsqueeze(0)
+                delta = self.ref_norm(self.refiner(tokens).squeeze(0) - tokens.squeeze(0))
+                gate = torch.tanh(self.ref_gate)
+                q, k = q.float() + gate * delta[:1], k.float() + gate * delta[1:]
         p = self.cfg.proj_dim
         temp = torch.exp(self.log_temp) + 1e-4
         aux: dict[str, torch.Tensor] = {}

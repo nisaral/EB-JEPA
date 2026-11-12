@@ -670,6 +670,9 @@ def main() -> None:
     ap.add_argument("--keep-option-index", action="store_true", help="Keep [i] option prefix even under --s1.")
     ap.add_argument("--isolate-options", action="store_true",
                     help="S1 v3: mask option-to-option attention in query_first & share option start position (exact order invariance).")
+    ap.add_argument("--refiner", action="store_true",
+                    help="Add permutation-equivariant self-attention interaction layer over [query; options] in head.")
+    ap.add_argument("--refiner-layers", type=int, default=1, help="Number of equivariant refiner layers when --refiner is set.")
     ap.add_argument("--s2-data", default="", help="Optional S2 directory with s2_train.jsonl / s2_selection.jsonl / eval_*.jsonl.")
     ap.add_argument("--s2-cost-weight", type=float, default=0.0,
                     help="S2 exact expected asymmetric action cost weight (0 = disabled).")
@@ -781,6 +784,8 @@ def main() -> None:
         if getattr(args, "isolate_options", False):
             cfg = replace(cfg, option_index=(cfg.option_index and not args.s1 and getattr(args, "keep_option_index", False)),
                           option_isolation=True)
+        if getattr(args, "refiner", False):
+            cfg = replace(cfg, refiner=True, refiner_layers=int(getattr(args, "refiner_layers", 1)))
         if getattr(args, "s2_cost_weight", 0.0) > 0:
             cfg = replace(cfg, cost_weight=float(args.s2_cost_weight))
         results[key] = train_one(key, cfg, args, train_rows, evals)

@@ -383,3 +383,53 @@ def test_upp_s2_expected_cost_loss_and_shrink_preserves_action_cards():
     assert not out["skipped"] and float(out["loss"]) > 0
     out["loss"].backward()
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in m.trainable_parameters())
+
+
+def test_isolated_options_with_stabilized_refiner_preserves_invariance_and_initial_scale():
+    import random
+
+    torch.manual_seed(0)
+    m_base = UPPModel(
+        UPPConfig(layout="query_first", head="dot", option_index=False, option_isolation=True, refiner=False),
+        use_mock=True,
+    ).eval()
+    torch.manual_seed(0)
+    m_ref = UPPModel(
+        UPPConfig(layout="query_first", head="dot", option_index=False, option_isolation=True, refiner=True, refiner_layers=1),
+        use_mock=True,
+    ).eval()
+
+    hq, hk = torch.randn(128), torch.randn(16, 128)
+    with torch.no_grad():
+        lg0, _ = m_base.head(hq, hk)
+        lgr, _ = m_ref.head(hq, hk)
+    # Stabilized residual refiner must NOT blow up initial logits (old refiner jumped to ~60).
+    assert float(lgr.abs().max()) < max(20.0, float(lg0.abs().max()) * 1.5)
+
+    crit = {
+        "datetime_add_to_date": "add days or months to a calendar date",
+        "calculate_date_difference": "compute days between two calendar dates",
+        "send_email": "send an email message to a recipient",
+        "__abstain__": "none of the listed tools fit",
+    }
+    p0, _ = m_ref.score(REC["state"], crit)
+    keys = list(crit)
+    rng = random.Random(19)
+    for _ in range(5):
+        perm = list(keys)
+        rng.shuffle(perm)
+        pk, _ = m_ref.score(REC["state"], {k: crit[k] for k in perm})
+        assert max(abs(p0[k] - pk[k]) for k in keys) < 1e-5
+
+    # Batched right-padded scoring must match unbatched scoring too.
+    crit2 = {"only_tool": "short description", "__abstain__": "none"}
+    batched = m_ref.batch_score([(REC["state"], crit, None), ("User Request: ping", crit2, None)], batch_size=2)
+    assert max(abs(batched[0][0][k] - p0[k]) for k in keys) < 1e-5
+
+    # Verify gradients reach refiner parameters cleanly.
+    m_ref.train()
+    out = m_ref.forward_batch([REC, REC])
+    out["loss"].backward()
+    mem = m_ref.head.members[0]
+    assert mem.ref_gate.grad is not None and mem.type_emb.grad is not None
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in mem.refiner.parameters())

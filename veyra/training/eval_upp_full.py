@@ -63,11 +63,12 @@ def _score_split_shard(
     shard_idx: int,
     shard_total: int,
     max_seq_len: int | None = None,
+    use_amp: bool = False,
 ) -> list[dict[str, Any]]:
     device = next(model.head.parameters()).device
     use_cuda = device.type == "cuda"
-    use_autocast = use_cuda and not torch.cuda.is_bf16_supported()
-    amp_dtype = torch.float16 if use_autocast else torch.bfloat16
+    use_autocast = use_cuda and use_amp and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_autocast else torch.float32
 
     sub_rows = [(i, r) for i, r in enumerate(rows) if i % shard_total == shard_idx]
     if not sub_rows:
@@ -93,7 +94,7 @@ def _score_split_shard(
 
     per_row_orders: list[dict[int, tuple[dict[str, float], dict[str, Any]]]] = [{} for _ in work_items]
     t0 = time.perf_counter()
-    with torch.autocast("cuda", dtype=amp_dtype, enabled=use_cuda):
+    with torch.autocast("cuda", dtype=amp_dtype, enabled=use_autocast):
         for start in range(0, len(flat_inputs), max(1, batch_size)):
             chunk = flat_inputs[start : start + max(1, batch_size)]
             res = model.batch_score(chunk, batch_size=len(chunk))
@@ -286,6 +287,7 @@ def main() -> None:
     ap.add_argument("--shard", default="0/1", help="Shard index/total, e.g. 0/2 or 1/2")
     ap.add_argument("--merge-shards", default="", help="Comma-separated scored_rows_*.json files to merge")
     ap.add_argument("--smoke", action="store_true", help="Mock/CPU tiny sanity mode")
+    ap.add_argument("--amp", action="store_true", help="Allow bf16 autocast on GPUs with native bf16 (off by default to match fp32 scoring)")
     ap.add_argument("--max-rows", type=int, default=0, help="Optional cap per split (0 = all rows)")
     ap.add_argument("--out", default=str(REPO / "veyra" / "runs" / "full_eval"))
     args = ap.parse_args()
@@ -314,7 +316,7 @@ def main() -> None:
     shard_idx_s, shard_tot_s = args.shard.split("/")
     shard_idx, shard_total = int(shard_idx_s), int(shard_tot_s)
     device = "cuda" if torch.cuda.is_available() and not args.smoke else "cpu"
-    dtype = None if (device == "cpu" or torch.cuda.is_bf16_supported()) else torch.float32
+    dtype = None if (device == "cpu" or (args.amp and torch.cuda.is_bf16_supported())) else torch.float32
     model = UPPModel.from_checkpoint(args.ckpt, use_mock=args.smoke, torch_dtype=dtype)
     if dtype is torch.float32 and not model.is_mock:
         model.backbone.float()
@@ -341,6 +343,7 @@ def main() -> None:
             shard_idx=shard_idx,
             shard_total=shard_total,
             max_seq_len=args.max_seq_len,
+            use_amp=args.amp,
         )
         all_scored.extend(scored)
 
@@ -361,3 +364,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
