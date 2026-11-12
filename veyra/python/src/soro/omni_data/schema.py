@@ -19,9 +19,23 @@ from typing import Any, Iterable, Iterator
 
 ABSTAIN = "__abstain__"
 NEED_INPUT = "__need_input__"
-SPECIAL = (ABSTAIN, NEED_INPUT)
+ANSWER = "__answer__"
+ASK = "__ask__"
+ESCALATE = "__escalate__"
+ACTION_CARDS = (ANSWER, ASK, ESCALATE, ABSTAIN)
+SPECIAL = (ABSTAIN, NEED_INPUT, ANSWER, ASK, ESCALATE)
 ABSTAIN_TEXT = "None of the listed tools or skills fit the user request."
 NEED_INPUT_TEXT = "The request depends on an image, file or recording that is missing or unreadable."
+ANSWER_TEXT = "Answer directly without calling any tool (request is conversational or already answerable)."
+ASK_TEXT = "Ask the user a brief clarifying question before acting (missing argument or ambiguous tool)."
+ESCALATE_TEXT = "Escalate to a stronger supervisor or human (high-risk irreversible mutation, policy boundary, or critical failure)."
+SPECIAL_TEXT = {
+    ABSTAIN: ABSTAIN_TEXT,
+    NEED_INPUT: NEED_INPUT_TEXT,
+    ANSWER: ANSWER_TEXT,
+    ASK: ASK_TEXT,
+    ESCALATE: ESCALATE_TEXT,
+}
 
 MODALITIES = ("text", "image", "audio", "image+audio")
 TASKS = ("tool_route", "ui_point", "typed_decision")
@@ -141,8 +155,10 @@ class OmniRow:
         return cls(**d)
 
 
-def special_option(key: str) -> Option:
-    return Option(key=key, text=ABSTAIN_TEXT if key == ABSTAIN else NEED_INPUT_TEXT, kind="special")
+def special_option(key: str, text: str | None = None) -> Option:
+    if key not in SPECIAL:
+        raise ValueError(f"Unknown special option {key!r}")
+    return Option(key=key, text=text if text is not None else SPECIAL_TEXT[key], kind="special")
 
 
 def read_rows(path: str | Path) -> Iterator[OmniRow]:

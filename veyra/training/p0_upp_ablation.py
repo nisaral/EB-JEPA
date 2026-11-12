@@ -363,8 +363,9 @@ def _shrink_menu(row: dict[str, Any], k: int, rng: random.Random) -> dict[str, A
     crit = dict(q["criteria"])
     gold = q["label"]
     keep = [gold]
-    if "__abstain__" in crit and gold != "__abstain__":
-        keep.append("__abstain__")
+    for card in ("__answer__", "__ask__", "__escalate__", "__abstain__"):
+        if card in crit and card not in keep:
+            keep.append(card)
     rest = [name for name in crit if name not in keep]
     gtoks = set(gold.lower().replace("-", "_").split("_"))
     rest.sort(key=lambda name: -len(gtoks & set(name.lower().replace("-", "_").split("_"))))
@@ -669,6 +670,9 @@ def main() -> None:
     ap.add_argument("--keep-option-index", action="store_true", help="Keep [i] option prefix even under --s1.")
     ap.add_argument("--isolate-options", action="store_true",
                     help="S1 v3: mask option-to-option attention in query_first & share option start position (exact order invariance).")
+    ap.add_argument("--s2-data", default="", help="Optional S2 directory with s2_train.jsonl / s2_selection.jsonl / eval_*.jsonl.")
+    ap.add_argument("--s2-cost-weight", type=float, default=0.0,
+                    help="S2 exact expected asymmetric action cost weight (0 = disabled).")
     ap.add_argument("--save-ckpt", action="store_true", help="Save trained LoRA adapter and UPP head to --out/ckpt_<key>.")
     ap.add_argument("--k-min", type=int, default=4)
     ap.add_argument("--k-max", type=int, default=64)
@@ -681,31 +685,50 @@ def main() -> None:
     if args.s1:
         args.configs = "A"
 
-    data_dir = resolve_data_dir(args.data_dir)
-    train_all = read_jsonl(data_dir / "train.jsonl")
-    train_all, selection = split_selection_packages(train_all, frac=0.05, seed=args.seed)
-    rng = random.Random(args.seed)
-    rng.shuffle(train_all)
-    zs_path = next((p for p in (
-        data_dir / "val_zeroshot.jsonl",
-        data_dir / "test.jsonl",
-        data_dir.parent / "stage_text" / "eval_zeroshot.jsonl",
-    ) if p.exists()), None)
-    if zs_path is None:
-        raise FileNotFoundError(f"No val_zeroshot.jsonl or test.jsonl under {data_dir}")
-    zs = read_jsonl(zs_path)
-    if args.eval_rows > 0:
-        stride = max(1, len(zs) // args.eval_rows)
-        sel_eval = selection[: args.eval_rows]
-        zs_eval = zs[::stride][: args.eval_rows]
+    if getattr(args, "s2_data", ""):
+        s2_dir = Path(args.s2_data)
+        train_all = read_jsonl(s2_dir / "s2_train.jsonl")
+        selection = read_jsonl(s2_dir / "s2_selection.jsonl") if (s2_dir / "s2_selection.jsonl").exists() else []
+        rng = random.Random(args.seed)
+        rng.shuffle(train_all)
+        sel_eval = selection[: args.eval_rows] if args.eval_rows > 0 else selection
+        evals = {"selection": sel_eval}
+        for ename, fname in (
+            ("zeroshot", "eval_zeroshot_s2.jsonl"),
+            ("external", "eval_external_s2.jsonl"),
+            ("when2call", "eval_when2call_mcq.jsonl"),
+            ("agentabstain", "eval_agentabstain.jsonl"),
+        ):
+            ep = s2_dir / fname
+            if ep.exists():
+                er = read_jsonl(ep)
+                evals[ename] = er[: args.eval_rows] if args.eval_rows > 0 else er
     else:
-        sel_eval = selection
-        zs_eval = zs
-    evals = {
-        "selection": sel_eval,
-        "zeroshot": zs_eval,
-        "bfcl": load_bfcl(),
-    }
+        data_dir = resolve_data_dir(args.data_dir)
+        train_all = read_jsonl(data_dir / "train.jsonl")
+        train_all, selection = split_selection_packages(train_all, frac=0.05, seed=args.seed)
+        rng = random.Random(args.seed)
+        rng.shuffle(train_all)
+        zs_path = next((p for p in (
+            data_dir / "val_zeroshot.jsonl",
+            data_dir / "test.jsonl",
+            data_dir.parent / "stage_text" / "eval_zeroshot.jsonl",
+        ) if p.exists()), None)
+        if zs_path is None:
+            raise FileNotFoundError(f"No val_zeroshot.jsonl or test.jsonl under {data_dir}")
+        zs = read_jsonl(zs_path)
+        if args.eval_rows > 0:
+            stride = max(1, len(zs) // args.eval_rows)
+            sel_eval = selection[: args.eval_rows]
+            zs_eval = zs[::stride][: args.eval_rows]
+        else:
+            sel_eval = selection
+            zs_eval = zs
+        evals = {
+            "selection": sel_eval,
+            "zeroshot": zs_eval,
+            "bfcl": load_bfcl(),
+        }
     toolret_stats = {}
     if args.toolret and not args.smoke:
         from toolret_data import build as build_toolret
@@ -758,6 +781,8 @@ def main() -> None:
         if getattr(args, "isolate_options", False):
             cfg = replace(cfg, option_index=(cfg.option_index and not args.s1 and getattr(args, "keep_option_index", False)),
                           option_isolation=True)
+        if getattr(args, "s2_cost_weight", 0.0) > 0:
+            cfg = replace(cfg, cost_weight=float(args.s2_cost_weight))
         results[key] = train_one(key, cfg, args, train_rows, evals)
         if toolret_stats:
             results[key]["toolret_first_stage"] = toolret_stats

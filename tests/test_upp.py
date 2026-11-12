@@ -347,3 +347,39 @@ def test_from_checkpoint_and_eval_upp_full_roundtrip(tmp_path):
     assert len(scored) == 4 and all(r["flipped"] == 0 for r in scored)
     summary = summarize_by_split(scored)["zeroshot"]
     assert summary["flip_rate"] == 0.0 and summary["subsets"]["collision"]["n"] == 1 and summary["subsets"]["near_miss"]["n"] == 1
+
+
+def test_upp_s2_expected_cost_loss_and_shrink_preserves_action_cards():
+    import random
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "veyra" / "training"))
+    from p0_upp_ablation import _shrink_menu
+
+    crit = {
+        "send_email": "send an email",
+        "t1": "tool 1", "t2": "tool 2", "t3": "tool 3", "t4": "tool 4",
+        "__answer__": "answer directly",
+        "__ask__": "ask clarifying question",
+        "__escalate__": "escalate",
+        "__abstain__": "abstain",
+    }
+    rec = {
+        "id": "s2-1",
+        "state": "User Request: send email now",
+        "questions": {"tool_route": {"criteria": crit, "label": "__ask__"}},
+        "meta": {"s2": {"costs": {k: (0.0 if k == "__ask__" else (1.5 if k.startswith(("send", "t")) else 0.6)) for k in crit}}},
+    }
+    shrunk = _shrink_menu(rec, k=6, rng=random.Random(0))
+    scrit = shrunk["questions"]["tool_route"]["criteria"]
+    assert {"__answer__", "__ask__", "__escalate__", "__abstain__"} <= set(scrit) and len(scrit) <= 6
+
+    m = UPPModel(
+        UPPConfig(layout="query_first", head="dot", option_index=False, option_isolation=True, cost_weight=0.5),
+        use_mock=True,
+    ).train()
+    out = m.forward_batch([rec, rec])
+    assert not out["skipped"] and float(out["loss"]) > 0
+    out["loss"].backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in m.trainable_parameters())

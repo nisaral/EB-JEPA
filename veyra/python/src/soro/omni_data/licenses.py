@@ -39,6 +39,9 @@ REGISTRY: dict[str, Source] = {s.name: s for s in [
     Source("screenspot_pro", "unknown", "image", "eval", "Check card before any training use"),
     Source("m3_bench", "unknown", "image", "eval", ""),
     Source("human_eval", "own", "any", "eval", "Our own human-written requests and recordings"),
+    Source("when2call", "cc-by-4.0", "text", "train", "NVIDIA When2Call benchmark (train SFT/pref and test MCQ/judge)"),
+    Source("agentabstain", "cc-by-4.0", "text", "eval", "AgentAbstain paired act vs abstain tasks across 8 abstention triggers"),
+    Source("s2_actions", "own", "text", "train", "S2 action-card (ANSWER/ASK/ESCALATE/ABSTAIN) + expected-cost training rows"),
 ]}
 
 # Upstream license per OS-Atlas sub-source (fill as each is verified).

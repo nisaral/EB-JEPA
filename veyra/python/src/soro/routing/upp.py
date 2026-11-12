@@ -98,6 +98,7 @@ class UPPConfig:
     readout: str = "vec"  # vec | xattn
     option_index: bool = True  # prepend "[i] " to options in non-block layouts
     option_isolation: bool = False  # in query_first: mask option-to-option attn & share start position
+    cost_weight: float = 0.0  # S2 exact expected asymmetric action cost weight (0 = off)
 
     def name(self) -> str:
         parts = [self.layout, self.head]
@@ -125,6 +126,8 @@ class UPPConfig:
             parts.append("noidx")
         if self.option_isolation:
             parts.append("iso")
+        if self.cost_weight > 0:
+            parts.append(f"cost{self.cost_weight:g}")
         return "+".join(parts)
 
 
@@ -679,7 +682,7 @@ class UPPModel(nn.Module):
     # ------------------------------------------------------------------ forward
     def forward_batch(self, records: list[dict[str, Any]], max_seq_len: int = 1024) -> dict[str, Any]:
         device = self._device
-        packs, golds = [], []
+        packs, golds, kept_recs = [], [], []
         for r in records:
             q = r["questions"]["tool_route"]
             pk = self.build(r["state"], q["criteria"], media=self._resolve_media(r.get("media")))
@@ -687,6 +690,7 @@ class UPPModel(nn.Module):
                 continue
             packs.append(pk)
             golds.append(pk["keys"].index(q["label"]) if q["label"] in pk["keys"] else 0)
+            kept_recs.append(r)
         if not packs:
             zero = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
             return {"loss": zero, "skipped": True, "logits": [], "kept": 0}
@@ -707,15 +711,21 @@ class UPPModel(nn.Module):
         n_exit = len(exit_hs)
         for b, pk in enumerate(packs):
             g = golds[b]
+            costs_dict = ((kept_recs[b].get("meta") or {}).get("s2") or {}).get("costs")
+            cost_vec = (
+                [float(costs_dict.get(k, 1.0)) for k in pk["keys"]]
+                if (self.cfg.cost_weight > 0 and costs_dict)
+                else None
+            )
             logits, aux = self._score(h[b], pk)
-            row = self._row_loss(logits, aux, g)
+            row = self._row_loss(logits, aux, g, cost_vec=cost_vec)
             if teacher_logits is not None:
                 pt = F.softmax(teacher_logits[b], -1)
                 row = row + self.cfg.gist_distill * F.kl_div(F.log_softmax(logits, -1), pt, reduction="sum")
             losses.append(row)
             for hs in exit_hs:
                 lg_e, aux_e = self._score(hs[b], pk)
-                losses.append(self.cfg.exit_weight / n_exit * self._row_loss(lg_e, aux_e, g))
+                losses.append(self.cfg.exit_weight / n_exit * self._row_loss(lg_e, aux_e, g, cost_vec=cost_vec))
             logits_out.append(logits)
             us.append(float(aux["u"].detach()))
         loss = torch.stack(losses).sum() / len(packs)
@@ -723,11 +733,16 @@ class UPPModel(nn.Module):
         return {"loss": loss, "skipped": False, "logits": logits_out, "kept": len(packs), "acc": acc,
                 "u": sum(us) / len(us), "keys": [pk["keys"] for pk in packs]}
 
-    def _row_loss(self, logits: torch.Tensor, aux: dict[str, torch.Tensor], g: int) -> torch.Tensor:
+    def _row_loss(
+        self, logits: torch.Tensor, aux: dict[str, torch.Tensor], g: int, cost_vec: list[float] | None = None
+    ) -> torch.Tensor:
         p = F.softmax(logits, -1)
         oh = torch.zeros_like(p)
         oh[g] = 1.0
         loss = -torch.log(p[g].clamp_min(1e-9)) + self.cfg.brier_weight * ((p - oh) ** 2).mean()
+        if cost_vec is not None and self.cfg.cost_weight > 0:
+            c = torch.as_tensor(cost_vec, dtype=p.dtype, device=logits.device)
+            loss = loss + self.cfg.cost_weight * (p * c).sum()
         if "member_logits" in aux:
             loss = loss + F.cross_entropy(aux["member_logits"], torch.full((aux["member_logits"].shape[0],), g,
                                           device=logits.device))

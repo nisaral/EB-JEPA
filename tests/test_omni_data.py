@@ -244,3 +244,137 @@ def test_dedupe_does_not_cap_distinct_ui_screens_on_generic_el_keys():
         ))
     kept, stats = quality.dedupe(rows, max_per_group_label=2)
     assert len(kept) == 5 and stats.get("capped", 0) == 0
+
+
+def test_s2_wrap_and_asymmetric_costs():
+    from soro.omni_data.s2_actions import action_cost, wrap_s2_row
+    from soro.omni_data.schema import ACTION_CARDS
+
+    r = _row(1, "delete the backup file", label="delete_backup", tools=("delete_backup", "send_email"))
+    s2 = wrap_s2_row(r, shuffle_seed=0)
+    keys = {o.key for o in s2.options}
+    assert set(ACTION_CARDS) <= keys and s2.validate() == []
+    costs = s2.meta["s2"]["costs"]
+    assert set(costs) == keys and costs["delete_backup"] == 0.0
+    # False/unsafe tool execution costs more than cautious deferral (ask/abstain/escalate).
+    assert action_cost("__ask__", "delete_backup") > action_cost("delete_backup", "__ask__")
+    assert action_cost("__escalate__", "delete_backup", risk_tier="high") == 2.0
+
+
+def test_s2_when2call_and_agentabstain_converters():
+    from soro.omni_data.s2_actions import (
+        from_agentabstain_rows,
+        from_when2call_mcq,
+        from_when2call_pref,
+        parse_agentabstain_env_source,
+    )
+    from soro.omni_data.schema import ABSTAIN, ANSWER, ASK, ESCALATE
+
+    tools = ['{"name": "get_weather", "description": "Get city weather", "parameters": {"type": "dict", "required": ["city"], "properties": {"city": {"type": "string"}}}}']
+    pref_recs = [
+        {"tools": tools, "messages": [{"role": "user", "content": "Weather in Pune?"}],
+         "chosen_response": {"role": "assistant", "content": '<TOOLCALL>[{"name": "get_weather", "arguments": {"city": "Pune"}}]</TOOLCALL>'}},
+        {"tools": tools, "messages": [{"role": "user", "content": "Weather?"}],
+         "chosen_response": {"role": "assistant", "content": "Which city would you like the weather for?"}},
+        {"tools": tools, "messages": [{"role": "user", "content": "Book a flight to Paris"}],
+         "chosen_response": {"role": "assistant", "content": "Apologies, I am unable to book flights."}},
+        {"tools": tools, "messages": [{"role": "user", "content": "What is 2+2?"}],
+         "chosen_response": {"role": "assistant", "content": "Four."}},
+    ]
+    pref_rows = from_when2call_pref(pref_recs)
+    assert [r.label for r in pref_rows] == ["get_weather", ASK, ABSTAIN, ANSWER]
+    assert all(r.validate() == [] for r in pref_rows)
+
+    mcq_recs = [
+        {"uuid": "1", "question": "q1", "correct_answer": "tool_call", "target_tool": tools[0], "tools": tools, "source": "live"},
+        {"uuid": "2", "question": "q2", "correct_answer": "request_for_info", "target_tool": None, "tools": tools, "source": "live"},
+        {"uuid": "3", "question": "q3", "correct_answer": "cannot_answer", "target_tool": None, "tools": tools, "source": "live"},
+    ]
+    mcq_rows = from_when2call_mcq(mcq_recs)
+    assert [r.label for r in mcq_rows] == ["get_weather", ASK, ABSTAIN] and all(r.split == "test" for r in mcq_rows)
+
+    env_src = '''
+class DemoEnv:
+    def _register_tools(self):
+        @self.mcp.tool()
+        def send_email(recipient: str, body: str) -> dict:
+            """Send an email to recipient."""
+            return {}
+        @self.mcp.tool()
+        def read_inbox() -> dict:
+            """Read messages in inbox."""
+            return {}
+'''
+    parsed = parse_agentabstain_env_source(env_src)
+    assert set(parsed) == {"send_email", "read_inbox"}
+    aa_tasks = [
+        {"pair_id": "missing_critical_parameter/1", "category": "missing_critical_parameter", "task_type": "act",
+         "phase": "pre_execution", "action_type": "operational", "instruction": "Email alex@x.com hi",
+         "system_prompt": "sys", "execution_dag": {"nodes": [{"tool": "demo.send_email"}]}, "environments": ["demo"]},
+        {"pair_id": "missing_critical_parameter/1", "category": "missing_critical_parameter", "task_type": "abstain",
+         "phase": "pre_execution", "action_type": "operational", "instruction": "Email hi",
+         "system_prompt": "sys", "execution_dag": {"nodes": []}, "environments": ["demo"]},
+        {"pair_id": "insufficient_tool_capability/2", "category": "insufficient_tool_capability", "task_type": "act",
+         "phase": "pre_execution", "action_type": "operational", "instruction": "Send an email",
+         "system_prompt": "sys", "execution_dag": {"nodes": [{"tool": "demo.send_email"}]}, "environments": ["demo"]},
+        {"pair_id": "insufficient_tool_capability/2", "category": "insufficient_tool_capability", "task_type": "abstain",
+         "phase": "pre_execution", "action_type": "operational", "instruction": "Send an email",
+         "system_prompt": "sys", "execution_dag": {"nodes": []}, "environments": ["demo"]},
+        {"pair_id": "high_stakes_action/3", "category": "high_stakes_action", "task_type": "abstain",
+         "phase": "pre_execution", "action_type": "operational", "instruction": "Delete all emails",
+         "system_prompt": "sys", "execution_dag": {"nodes": []}, "environments": ["demo"]},
+        {"pair_id": "critical_tool_failure/4", "category": "critical_tool_failure", "task_type": "abstain",
+         "phase": "runtime", "action_type": "informational", "instruction": "Read inbox",
+         "system_prompt": "sys", "execution_dag": {"nodes": []}, "environments": ["demo"]},
+    ]
+    aa_rows = from_agentabstain_rows(aa_tasks, {"demo": parsed}, include_runtime=False)
+    assert len(aa_rows) == 5
+    by_id = {r.id: r for r in aa_rows}
+    assert by_id["aa-missing_critical_parameter_1-act"].label == "send_email"
+    assert by_id["aa-missing_critical_parameter_1-abstain"].label == ASK
+    insuff = by_id["aa-insufficient_tool_capability_2-abstain"]
+    assert insuff.label == ABSTAIN and "send_email" not in {o.key for o in insuff.options}
+    assert by_id["aa-high_stakes_action_3-abstain"].label == ESCALATE
+
+
+def test_s2_deterministic_builders_conformal_and_stage_smoke(tmp_path):
+    import sys
+    from pathlib import Path
+    import torch
+    from soro.omni_data.s2_actions import (
+        action_group_conformal,
+        build_answer_from_soro,
+        build_ask_from_soro,
+        build_escalate_from_soro,
+        expected_cost_loss,
+    )
+    from soro.omni_data.schema import ANSWER, ASK, ESCALATE
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "veyra" / "omni_data"))
+    import stage_s2
+
+    base = [
+        _row(i, f"Send an email report to user{i}@example.com right now", label="delete_old_logs",
+             tools=("delete_old_logs", "send_email", "get_weather"))
+        for i in range(10)
+    ]
+    asks = build_ask_from_soro(base, limit=5, seed=1)
+    escs = build_escalate_from_soro(base, limit=5, seed=2)
+    anss = build_answer_from_soro(base, limit=5, seed=3)
+    assert asks and all(r.label == ASK and r.validate() == [] for r in asks)
+    assert escs and all(r.label == ESCALATE and r.validate() == [] for r in escs)
+    assert anss and all(r.label == ANSWER and r.validate() == [] for r in anss)
+
+    logits = torch.tensor([10.0, 0.0, 0.0], requires_grad=True)
+    cost = expected_cost_loss(logits, [0.0, 1.5, 0.45])
+    assert float(cost) < 1e-3
+    cost.backward()
+    assert logits.grad is not None
+
+    items = [({"get_weather": 0.9, ASK: 0.05, ESCALATE: 0.02, ANSWER: 0.02, ABSTAIN: 0.01}, "get_weather") for _ in range(10)]
+    items += [({"get_weather": 0.05, ASK: 0.85, ESCALATE: 0.05, ANSWER: 0.03, ABSTAIN: 0.02}, ASK) for _ in range(10)]
+    conf = action_group_conformal(items, alpha=0.1)
+    assert conf["overall"]["coverage"] >= 0.9 and {"tool", "ask"} <= set(conf["by_action"])
+
+    rep = stage_s2._smoke_build(tmp_path)
+    assert set(rep["train_classes"]) == {"tool", "abstain", "ask", "escalate", "answer"}

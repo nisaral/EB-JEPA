@@ -20,12 +20,18 @@ from pathlib import Path
 from typing import Any
 
 from soro.omni_data import licenses, quality
-from soro.omni_data.schema import ABSTAIN, NEED_INPUT, OmniRow, read_rows, write_rows
+from soro.omni_data.schema import ABSTAIN, ANSWER, ASK, ESCALATE, NEED_INPUT, OmniRow, read_rows, write_rows
 
 
 def kind_of(r: OmniRow) -> str:
     if r.label == NEED_INPUT:
         return "need_input"
+    if r.label == ANSWER:
+        return "answer"
+    if r.label == ASK:
+        return "ask"
+    if r.label == ESCALATE:
+        return "escalate"
     if "near_miss" in r.tags:
         return "near_miss"
     if r.label == ABSTAIN:
