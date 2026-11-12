@@ -149,6 +149,7 @@ def _score_split_shard(
                 "abstain": int(g == "__abstain__"),
                 "collision": int("collision" in tags),
                 "near_miss": int("near_miss" in tags),
+                "cats": sorted(t for t in tags if t.startswith("cat:")),
                 "flipped": int(flipped),
                 "max_spread": float(max_spread),
                 "probs": probs0,
@@ -241,10 +242,15 @@ def summarize_by_split(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
         tool_rows = [r for r in srows if not r["abstain"]]
         if tool_rows:
             subsets["tool_call"] = summarize_scored_rows(tool_rows, include_conformal=False)
-        for act in ("tool", "ask", "abstain", "escalate", "answer"):
+        for act in ("tool", "ask", "abstain", "answer"):
             arows = [r for r in srows if r.get("gold_kind", action_kind(r["gold"])) == act]
             if arows and len(arows) < len(srows):
                 subsets[f"action:{act}"] = summarize_scored_rows(arows, include_conformal=False)
+        all_cats = sorted({c for r in srows for c in (r.get("cats") or [])})
+        for cat in all_cats:
+            crows = [r for r in srows if cat in (r.get("cats") or [])]
+            if crows and len(crows) < len(srows):
+                subsets[cat] = summarize_scored_rows(crows, include_conformal=False)
         if subsets:
             entry["subsets"] = subsets
         summary[name] = entry

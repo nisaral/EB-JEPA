@@ -1,12 +1,18 @@
-"""S2 Action Cards (ANSWER / ASK / ESCALATE / ABSTAIN) & Asymmetric Expected-Cost Helpers.
+"""S2 Action Cards (ANSWER / ASK / ABSTAIN), Asymmetric Costs & Inference-Time Escalation.
 
-Implements PLAN v4 S2 without GPU generation:
-  * Every S2 row keeps all four action cards in its menu alongside real tool options.
+Implements the 4-action S2 schema + inference-time escalation policy:
+  * Learned S2 menus contain 3 special action cards (``ANSWER``, ``ASK``, ``ABSTAIN``)
+    alongside real tool options (4 learned decision types: tool / answer / ask / abstain),
+    matching ``nvidia/When2Call``'s action taxonomy cleanly.
+  * ``ESCALATE`` is NOT a learned class: it is applied at inference time via
+    ``predict_s2_decision`` whenever the plausible prediction set is large and
+    expected error cost is high (``set_size * error_cost >= threshold``), while
+    high-stakes rows are preserved in ``eval_escalate_probe.jsonl`` as an eval-only probe.
   * Cards carry explicit cost descriptions, and ``row.meta["s2"]`` stores the exact
     per-option asymmetric cost vector ``costs: dict[str, float]`` for ``expected_cost_loss``.
   * Converters ingest ``nvidia/When2Call`` (CC BY 4.0) and ``antiquality/agentabstain``
-    (CC BY 4.0, eval-only), plus deterministic ASK / ESCALATE / ANSWER construction over
-    ``soro_train`` tool menus.
+    (CC BY 4.0, eval-only), plus deterministic ASK / ANSWER construction and high-stakes
+    probe builders over ``soro_train`` tool menus.
   * Includes per-action-group (Mondrian) split conformal calibration across action types.
 """
 
@@ -36,15 +42,11 @@ from soro.omni_data.schema import (
 S2_CARD_TEXT: dict[str, str] = {
     ANSWER: (
         "Answer directly without calling any tool (cautious deferral cost 0.45 if unnecessary; "
-        "false direct-answer cost 1.1-1.5 when execution or escalation is needed)."
+        "false direct-answer cost 1.1-1.5 when execution or clarification is needed)."
     ),
     ASK: (
         "Ask the user a brief clarifying question before acting (cautious ask cost 0.40-0.45; "
         "guessing a tool blindly costs 1.5)."
-    ),
-    ESCALATE: (
-        "Escalate to a stronger supervisor or human for confirmation (cautious escalate cost 0.55-0.60; "
-        "unsafe high-risk execution without approval costs 2.0)."
     ),
     ABSTAIN: (
         "Abstain because no listed tool or capability fits the request (safe abstain cost 0.50-0.80; "
@@ -158,7 +160,7 @@ def action_kind(key: str) -> str:
 
 def s2_card_option(key: str) -> Option:
     if key not in S2_CARD_TEXT:
-        raise ValueError(f"Unknown S2 action card {key!r}; expected one of {ACTION_CARDS}")
+        raise ValueError(f"Unknown S2 action card {key!r}; expected one of {tuple(S2_CARD_TEXT)}")
     return Option(key=key, text=S2_CARD_TEXT[key], kind="special")
 
 
@@ -666,6 +668,7 @@ def from_agentabstain_rows(
     *,
     split: str = "test",
     include_runtime: bool = False,
+    include_escalate_probes: bool = False,
 ) -> list[OmniRow]:
     task_list = list(tasks)
     # Map pair_id -> sibling 'act' DAG tools so 'insufficient_tool_capability' knows what to drop.
@@ -695,6 +698,7 @@ def from_agentabstain_rows(
         if not instr:
             continue
 
+        is_escalate_probe = False
         if ttype == "act":
             nodes = (r.get("execution_dag") or {}).get("nodes") or []
             if not nodes or not nodes[0].get("tool"):
@@ -708,6 +712,12 @@ def from_agentabstain_rows(
             )
             if gold is None:
                 continue
+            if gold == ESCALATE:
+                if not include_escalate_probes:
+                    continue
+                is_escalate_probe = True
+                # Keep valid 4-action label for schema compatibility; track probe_gold = ESCALATE in meta.
+                gold = ABSTAIN
             if cat == "insufficient_tool_capability":
                 drop_tool = act_first_tool.get(pair_id)
                 trig = r.get("abstention_trigger") or {}
@@ -723,6 +733,12 @@ def from_agentabstain_rows(
 
         risk = "high" if cat == "high_stakes_action" or r.get("action_type") == "operational" else "low"
         sys_prompt = str(r.get("system_prompt") or "").strip()
+        extra_tags = ["probe:escalate"] if is_escalate_probe else []
+        meta = {"pair_id": pair_id, "category": cat, "task_type": ttype, "phase": phase}
+        if is_escalate_probe:
+            meta["probe_gold"] = ESCALATE
+            if act_first_tool.get(pair_id):
+                meta["tempting_tool"] = act_first_tool[pair_id]
         row = OmniRow(
             id=f"aa-{pair_id.replace('/', '_')}-{ttype}",
             task="tool_route",
@@ -736,10 +752,10 @@ def from_agentabstain_rows(
             context=sys_prompt,
             package=",".join(envs) if envs else "agentabstain",
             split=split,
-            tags=["agentabstain", f"phase:{phase}", f"cat:{cat}"],
-            meta={"pair_id": pair_id, "category": cat, "task_type": ttype, "phase": phase},
+            tags=["agentabstain", f"phase:{phase}", f"cat:{cat}", *extra_tags],
+            meta=meta,
         )
-        out.append(wrap_s2_row(row, risk_tier=risk, shuffle_seed=idx))
+        out.append(wrap_s2_row(row, risk_tier=risk, extra_tags=extra_tags, shuffle_seed=idx))
     return out
 
 
@@ -992,8 +1008,14 @@ _ESCALATE_SUFFIXES = (
 )
 
 
-def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed: int = 2) -> list[OmniRow]:
-    """Create high-stakes ESCALATE rows over real destructive/financial/privilege tool menus."""
+def build_escalate_from_soro(
+    rows: Iterable[OmniRow],
+    *,
+    limit: int = 1500,
+    seed: int = 2,
+    as_probe: bool = True,
+) -> list[OmniRow]:
+    """Create eval-only high-stakes ESCALATE probe rows over real destructive/financial/privilege tool menus."""
     rng = random.Random(seed)
     cands = []
     for r in rows:
@@ -1021,17 +1043,23 @@ def build_escalate_from_soro(rows: Iterable[OmniRow], *, limit: int = 1500, seed
             break
         mod = _ESCALATE_SUFFIXES[i % len(_ESCALATE_SUFFIXES)]
         txt = f"{r.text.rstrip('.!?')}. {mod}"
+        meta = {**r.meta, "parent": r.id, "tempting_tool": r.label}
+        extra_tags = ["probe:escalate"] if as_probe else []
+        if as_probe:
+            meta["probe_gold"] = ESCALATE
         row = replace(
             r,
             id=f"{r.id}~esc",
             text=txt,
             source="s2_actions",
             license=("cc-by-4.0" if r.license == "cc-by-4.0" else "own"),
-            tags=[*r.tags, "derived", "high_stakes_escalate"],
+            split="test" if as_probe else r.split,
+            tags=[*r.tags, "derived", "high_stakes_escalate", *extra_tags],
             teacher=None,
-            meta={**r.meta, "parent": r.id, "tempting_tool": r.label},
+            meta=meta,
         )
-        out.append(wrap_s2_row(row, label=ESCALATE, risk_tier="high", shuffle_seed=seed + i))
+        lbl = ABSTAIN if as_probe else ESCALATE
+        out.append(wrap_s2_row(row, label=lbl, risk_tier="high", extra_tags=extra_tags, shuffle_seed=seed + i))
     return out
 
 
@@ -1273,3 +1301,104 @@ def action_group_conformal(
         },
         "by_action": summary_groups,
     }
+
+
+def option_risk_weight(key: str, text: str = "", risk_tier: str = "low") -> float:
+    """Error risk weight of option ``k`` from menu metadata only (no user-prompt keywords)."""
+    kind = action_kind(key)
+    if kind in ("ask", "abstain"):
+        return 0.0
+    if kind == "answer":
+        return 0.6
+    if risk_tier == "high":
+        return 2.0
+    if _HIGH_RISK_WORDS.search(f"{key.replace('_', ' ')} {str(text)[:220]}"):
+        return 2.0
+    return 1.0
+
+
+def plausible_set(probs: dict[str, float], q_hat: float = 0.85) -> list[str]:
+    """LAC plausible option set ``{k : 1 - p(k) <= q_hat}`` (non-empty fallback to top-1)."""
+    if not probs:
+        return []
+    pset = [k for k, p in sorted(probs.items(), key=lambda kv: -kv[1]) if (1.0 - float(p)) <= q_hat]
+    if not pset:
+        pset = [max(probs, key=probs.get)]
+    return pset
+
+
+def escalate_rule_score(
+    probs: dict[str, float],
+    option_texts: dict[str, str] | None = None,
+    *,
+    q_hat: float = 0.85,
+    risk_tier: str = "low",
+) -> dict[str, Any]:
+    """Inference-time cost-aware handoff score: ``set_size * plausible_error_cost``.
+
+    Uses only posterior probabilities ``probs`` and menu tool metadata (never user text):
+      * ``set_size``: number of plausible actions under conformal quantile ``q_hat``.
+      * ``max_plausible_risk``: highest execution risk weight among plausible options.
+      * ``expected_top_cost``: Bayes expected cost of the top-1 choice under ``probs``.
+      * ``error_cost``: ``max(expected_top_cost, max_plausible_risk * (1 - p(ask) - p(abstain)))``.
+      * ``score``: ``set_size * error_cost``.
+    """
+    if not probs:
+        return {
+            "top": "",
+            "plausible_set": [],
+            "set_size": 0,
+            "max_plausible_risk": 0.0,
+            "expected_top_cost": 0.0,
+            "error_cost": 0.0,
+            "score": 0.0,
+        }
+    opt_map = option_texts or {}
+    pset = plausible_set(probs, q_hat=q_hat)
+    set_size = len(pset)
+    top = max(probs, key=probs.get)
+    top_risk = option_risk_weight(top, opt_map.get(top, ""), risk_tier=risk_tier)
+    eff_tier = "high" if (risk_tier == "high" or top_risk >= 2.0) else "low"
+    expected_top_cost = sum(
+        float(pg) * action_cost(g, top, risk_tier=eff_tier) for g, pg in probs.items()
+    )
+    max_plausible_risk = max(
+        (option_risk_weight(k, opt_map.get(k, ""), risk_tier=risk_tier) for k in pset),
+        default=0.0,
+    )
+    defer_mass = float(probs.get(ASK, 0.0)) + float(probs.get(ABSTAIN, 0.0))
+    non_defer_mass = max(0.0, 1.0 - defer_mass)
+    error_cost = max(expected_top_cost, max_plausible_risk * non_defer_mass)
+    score = float(set_size) * float(error_cost)
+    return {
+        "top": top,
+        "plausible_set": pset,
+        "set_size": set_size,
+        "max_plausible_risk": float(max_plausible_risk),
+        "expected_top_cost": float(expected_top_cost),
+        "error_cost": float(error_cost),
+        "score": float(score),
+    }
+
+
+def predict_s2_decision(
+    probs: dict[str, float],
+    option_texts: dict[str, str] | None = None,
+    *,
+    q_hat: float = 0.85,
+    min_set_size: int = 2,
+    cost_thresh: float = 2.0,
+    abstain_thresh: float | None = None,
+    risk_tier: str = "low",
+) -> tuple[str, dict[str, Any]]:
+    """Apply inference-time ESCALATE (set size x cost) and optional ABSTAIN threshold over 4-action probs."""
+    info = escalate_rule_score(probs, option_texts, q_hat=q_hat, risk_tier=risk_tier)
+    decision = info["top"]
+    if info["set_size"] >= min_set_size and info["score"] >= cost_thresh:
+        decision = ESCALATE
+    elif abstain_thresh is not None and ABSTAIN in probs:
+        top_tool_p = max((float(p) for k, p in probs.items() if k not in SPECIAL), default=0.0)
+        if float(probs[ABSTAIN]) >= abstain_thresh or (top_tool_p < (1.0 - abstain_thresh) and float(probs[ABSTAIN]) >= float(probs.get(ASK, 0.0))):
+            decision = ABSTAIN
+    info["decision"] = decision
+    return decision, info

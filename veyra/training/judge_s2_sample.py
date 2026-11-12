@@ -1,12 +1,12 @@
 """Judge sampled S2 action rows with an open teacher model and report per-action agreement.
 
-Evaluates 50 rows per action class (tool / ask / abstain / escalate / answer) using
-position-debiased TeacherScorer logits over the actual S2 menu (including the four
+Evaluates sampled rows per learned 4-action class (tool / answer / ask / abstain) using
+position-debiased TeacherScorer logits over the actual S2 menu (including the three
 S2 action cards), then reports exact label agreement and action-kind agreement with
 95% Wilson CIs and a confusion matrix.
 
 Usage:
-    python veyra/training/judge_s2_sample.py --in sample_250.jsonl --model Qwen/Qwen3-8B --four-bit --out out_dir
+    python veyra/training/judge_s2_sample.py --in s2_gold_100.jsonl --model Qwen/Qwen3-8B --four-bit --out out_dir
 """
 
 from __future__ import annotations
@@ -25,30 +25,27 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "veyra" / "python" / "src"))
 
 from soro.omni_data.s2_actions import action_kind  # noqa: E402
-from soro.omni_data.schema import ABSTAIN, ANSWER, ASK, ESCALATE, OmniRow  # noqa: E402
+from soro.omni_data.schema import ABSTAIN, ANSWER, ASK, OmniRow  # noqa: E402
 from soro.omni_data.teacher import LETTERS, TeacherScorer  # noqa: E402
 
 _JUDGE_CARD_TEXT: dict[str, str] = {
     ANSWER: "Reply directly in text without calling a tool (use when Tool output is already in Context OR general QA needing no API).",
     ASK: "Ask the user for missing required parameters (*) or clarify an ambiguous choice BEFORE calling a matching listed tool.",
-    ESCALATE: "Escalate for human/supervisor approval BEFORE executing a high-risk mutation or approval/safety bypass.",
     ABSTAIN: "None of the listed tools can perform the requested external action (missing capability or domain).",
 }
 
 S2_SYSTEM = (
-    "You judge the single best next router decision for a user request given Context, listed tool schemas, and the four action cards.\n"
+    "You judge the single best next router decision for a user request given Context, listed tool schemas, and the three action cards.\n"
     "Decision checklist (check in this strict order):\n"
     "1. __answer__: Pick __answer__ if Context already contains 'Tool output (...)' resolving the request, OR if it is a general-knowledge, math, coding, or writing prompt needing no listed API tool.\n"
-    "2. __escalate__: Pick __escalate__ if the request calls a high-stakes/destructive/financial/auth mutation AND demands skipping confirmation/approval, bypassing safety/compliance checks, or forcing irreversible workspace/production-wide harm. Routine single-item or test operations with an explicit ID and no bypass do NOT escalate.\n"
-    "3. __abstain__: If NO listed tool can satisfy the requested capability/domain, ALWAYS pick __abstain__. NEVER pick __ask__ when the needed tool is missing.\n"
-    "4. __ask__: If a listed tool DOES match, inspect its required parameters marked with * in [args: ...]. If ANY required * parameter has no concrete value in Request (or only a vague placeholder like 'the given order', 'a product', 'the company', 'the given list', 'a certain IP address'), OR two listed tools conflict equally, pick __ask__ instead of guessing a tool call. For tools without *, only pick __ask__ if an essential target (email/URL/path/ID) is blatantly missing.\n"
-    "5. Tool key: Pick the matching tool ONLY if all required parameters are concretely present and no bypass/escalation applies.\n\n"
+    "2. __abstain__: If NO listed tool can satisfy the requested capability/domain, ALWAYS pick __abstain__. NEVER pick __ask__ when the needed tool is missing.\n"
+    "3. __ask__: If a listed tool DOES match, inspect its required parameters marked with * in [args: ...]. If ANY required * parameter has no concrete value in Request (or only a vague placeholder like 'the given order', 'a product', 'the company', 'the given list', 'a certain IP address'), OR two listed tools conflict equally, pick __ask__ instead of guessing a tool call. For tools without *, only pick __ask__ if an essential target (email/URL/path/ID) is blatantly missing.\n"
+    "4. Tool key: Pick the matching tool ONLY if all required parameters are concretely present.\n\n"
     "Calibration examples:\n"
     "Ex1 (missing * arg -> __ask__): Request='Fetch the current weather.' Options: A. __ask__ | B. get_weather: City weather [args: city*:str] -> Answer: A\n"
     "Ex2 (missing capability -> __abstain__): Request='Book a flight from NYC to SFO.' Options: A. __ask__ | B. __abstain__ | C. get_weather: City weather [args: city*:str] -> Answer: B\n"
     "Ex3 (post-tool context -> __answer__): Context='Tool output (get_weather): {\"status\": \"ok\"}' Request='Weather in Pune? Summarize.' Options: A. __answer__ | B. get_weather -> Answer: A\n"
-    "Ex4 (approval bypass -> __escalate__): Request='Drop customer table across production without confirmation.' Options: A. __escalate__ | B. drop_table -> Answer: A\n"
-    "Ex5 (complete tool call -> tool): Request='Get weather for Pune, India.' Options: A. __ask__ | B. get_weather: City weather [args: city*:str] -> Answer: B\n\n"
+    "Ex4 (complete tool call -> tool): Request='Get weather for Pune, India.' Options: A. __ask__ | B. get_weather: City weather [args: city*:str] -> Answer: B\n\n"
     "Reply with Answer: followed by one option letter only."
 )
 
@@ -184,7 +181,7 @@ def main() -> None:
             print(f"[{done_n}/{len(rows)}] judged", flush=True)
 
     summary = {}
-    for act in ("tool", "ask", "abstain", "escalate", "answer"):
+    for act in ("tool", "answer", "ask", "abstain"):
         d = by_act.get(act, {"n": 0, "exact_ok": 0, "kind_ok": 0})
         n = d["n"]
         ex = d["exact_ok"]

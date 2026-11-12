@@ -327,14 +327,18 @@ class DemoEnv:
          "phase": "runtime", "action_type": "informational", "instruction": "Read inbox",
          "system_prompt": "sys", "execution_dag": {"nodes": []}, "environments": ["demo"]},
     ]
-    aa_rows = from_agentabstain_rows(aa_tasks, {"demo": parsed}, include_runtime=False)
-    assert len(aa_rows) == 5
+    aa_rows = from_agentabstain_rows(aa_tasks, {"demo": parsed}, include_runtime=False, include_escalate_probes=False)
+    assert len(aa_rows) == 4
     by_id = {r.id: r for r in aa_rows}
     assert by_id["aa-missing_critical_parameter_1-act"].label == "send_email"
     assert by_id["aa-missing_critical_parameter_1-abstain"].label == ASK
     insuff = by_id["aa-insufficient_tool_capability_2-abstain"]
     assert insuff.label == ABSTAIN and "send_email" not in {o.key for o in insuff.options}
-    assert by_id["aa-high_stakes_action_3-abstain"].label == ESCALATE
+    aa_probe_rows = from_agentabstain_rows(aa_tasks, {"demo": parsed}, include_runtime=False, include_escalate_probes=True)
+    probe_by_id = {r.id: r for r in aa_probe_rows}
+    hi = probe_by_id["aa-high_stakes_action_3-abstain"]
+    assert hi.label == ABSTAIN and hi.meta["probe_gold"] == ESCALATE and "probe:escalate" in hi.tags
+    assert ESCALATE not in {o.key for o in hi.options}
 
 
 def test_s2_deterministic_builders_conformal_and_stage_smoke(tmp_path):
@@ -346,7 +350,9 @@ def test_s2_deterministic_builders_conformal_and_stage_smoke(tmp_path):
         build_answer_from_soro,
         build_ask_from_soro,
         build_escalate_from_soro,
+        escalate_rule_score,
         expected_cost_loss,
+        predict_s2_decision,
     )
     from soro.omni_data.schema import ANSWER, ASK, ESCALATE
 
@@ -359,10 +365,13 @@ def test_s2_deterministic_builders_conformal_and_stage_smoke(tmp_path):
         for i in range(10)
     ]
     asks = build_ask_from_soro(base, limit=5, seed=1)
-    escs = build_escalate_from_soro(base, limit=5, seed=2)
+    escs = build_escalate_from_soro(base, limit=5, seed=2, as_probe=True)
     anss = build_answer_from_soro(base, limit=5, seed=3)
     assert asks and all(r.label == ASK and r.validate() == [] for r in asks)
-    assert escs and all(r.label == ESCALATE and r.validate() == [] for r in escs)
+    assert escs and all(
+        r.label == ABSTAIN and r.meta["probe_gold"] == ESCALATE and "probe:escalate" in r.tags and r.validate() == []
+        for r in escs
+    )
     assert anss and all(r.label == ANSWER and r.validate() == [] for r in anss)
 
     logits = torch.tensor([10.0, 0.0, 0.0], requires_grad=True)
@@ -371,13 +380,23 @@ def test_s2_deterministic_builders_conformal_and_stage_smoke(tmp_path):
     cost.backward()
     assert logits.grad is not None
 
-    items = [({"get_weather": 0.9, ASK: 0.05, ESCALATE: 0.02, ANSWER: 0.02, ABSTAIN: 0.01}, "get_weather") for _ in range(10)]
-    items += [({"get_weather": 0.05, ASK: 0.85, ESCALATE: 0.05, ANSWER: 0.03, ABSTAIN: 0.02}, ASK) for _ in range(10)]
+    items = [({"get_weather": 0.9, ASK: 0.05, ANSWER: 0.03, ABSTAIN: 0.02}, "get_weather") for _ in range(10)]
+    items += [({"get_weather": 0.05, ASK: 0.85, ANSWER: 0.06, ABSTAIN: 0.04}, ASK) for _ in range(10)]
     conf = action_group_conformal(items, alpha=0.1)
     assert conf["overall"]["coverage"] >= 0.9 and {"tool", "ask"} <= set(conf["by_action"])
 
+    # Inference-time ESCALATE rule: uncertain + high-risk menu escalates; confident low-risk executes.
+    hi_probs = {"delete_account": 0.55, ABSTAIN: 0.35, ASK: 0.05, ANSWER: 0.05}
+    hi_dec, hi_info = predict_s2_decision(hi_probs, {"delete_account": "Delete all user accounts permanently"}, risk_tier="high")
+    assert hi_info["set_size"] >= 2 and hi_info["score"] >= 2.0 and hi_dec == ESCALATE
+    lo_probs = {"get_weather": 0.94, ABSTAIN: 0.03, ASK: 0.02, ANSWER: 0.01}
+    lo_dec, lo_info = predict_s2_decision(lo_probs, {"get_weather": "Get current city weather"}, risk_tier="low")
+    assert lo_info["set_size"] == 1 and lo_dec == "get_weather"
+    assert escalate_rule_score(hi_probs, risk_tier="high")["score"] > escalate_rule_score(lo_probs, risk_tier="low")["score"]
+
     rep = stage_s2._smoke_build(tmp_path)
-    assert set(rep["train_classes"]) == {"tool", "abstain", "ask", "escalate", "answer"}
+    assert set(rep["train_classes"]) == {"tool", "abstain", "ask", "answer"}
+    assert rep["escalate_probe_count"] > 0
 
 
 def test_s2_clean_filters_schema_star_and_done_target():
@@ -465,7 +484,8 @@ def test_s2_clean_filters_schema_star_and_done_target():
     assert s2_done.label == "__done__" and "__done__" in {o.key for o in s2_done.options}
     r_other_target = _row(13, "What is the weather today in Pune?", label="get_weather", tools=("__done__", "get_weather"))
     s2_other = wrap_s2_row(r_other_target, shuffle_seed=0)
-    assert "__done__" not in {o.key for o in s2_other.options} and {ANSWER, ASK, ESCALATE, ABSTAIN} <= {o.key for o in s2_other.options}
+    assert "__done__" not in {o.key for o in s2_other.options} and {ANSWER, ASK, ABSTAIN} <= {o.key for o in s2_other.options}
+    assert ESCALATE not in {o.key for o in s2_other.options}
 
 
 def test_s2_strict_hygiene_regressions():
@@ -478,6 +498,7 @@ def test_s2_strict_hygiene_regressions():
         build_escalate_from_soro,
         from_when2call_pref,
     )
+    from soro.omni_data.schema import ESCALATE
 
     tr_dir = Path(__file__).resolve().parents[1] / "veyra" / "training"
     if str(tr_dir) not in sys.path:
@@ -499,8 +520,8 @@ def test_s2_strict_hygiene_regressions():
         _row(31, "Remove temporary file at /tmp/scratch.txt cleanly", label="delete_file", tools=("delete_file", "read_file")),
         _row(32, "Drop the production billing_ledger records immediately", label="delete_database_record", tools=("delete_database_record", "read_file")),
     ]
-    escs = build_escalate_from_soro(esc_cands, limit=10, seed=0)
-    assert [r.meta["parent"] for r in escs] == ["32"]
+    escs = build_escalate_from_soro(esc_cands, limit=10, seed=0, as_probe=True)
+    assert [r.meta["parent"] for r in escs] == ["32"] and all(r.meta["probe_gold"] == ESCALATE for r in escs)
 
     # 3. Anaphoric / short queries are skipped by build_abstain_cross_domain.
     unrelated = [
