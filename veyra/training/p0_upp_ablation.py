@@ -730,7 +730,7 @@ def main() -> None:
     if getattr(args, "s2_data", ""):
         s2_dir = Path(args.s2_data)
         tr_file = next(
-            (s2_dir / cand for cand in ("s2_train_teacher.jsonl", "s2_train_filtered.jsonl", "s2_train.jsonl") if (s2_dir / cand).exists()),
+            (s2_dir / cand for cand in ("s2_train_filtered_exact.jsonl", "s2_train_filtered.jsonl", "s2_train_teacher.jsonl", "s2_train.jsonl") if (s2_dir / cand).exists()),
             s2_dir / "s2_train.jsonl",
         )
         print(f"loading S2 train from {tr_file.name}", flush=True)
