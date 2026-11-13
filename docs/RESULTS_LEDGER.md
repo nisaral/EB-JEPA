@@ -8,6 +8,19 @@ Rules:
 - Final paper ladder configs get **3 seeds** (`42, 43, 44`); single-seed numbers are marked `1 seed`.
 - Every percentage includes exact counts (`k/N`) and 95% Wilson score intervals (`[lo, hi]`).
 
+### C. Expanded Collisions Split (`n=1,641`) Verification & Disjointness Method
+- **Methodology & Mining:** Mined using `ToolPool` from held-out validation queries (`eval_zeroshot.jsonl` + `eval_external.jsonl`), completely disjoint from training queries.
+- **Verification Criteria (100% verified):**
+  1. Gold target is preserved in the options menu.
+  2. Exactly 2 distinct semantic lookalikes mined via embedding similarity ($k=2$) are included.
+  3. All menu option keys are strictly unique.
+  4. Prompt query is an uncorrupted validation query.
+- **Disjointness Accounting:**
+  - Of the 1,891 unique tools across the 1,641 rows: 831 tools come from `eval_external` (100% disjoint from all training packages); 1,060 tools overlap with the broad omni catalog.
+  - Thus, this split represents a **semi-disjoint collision benchmark** (100% unseen queries, mixed in-domain & external tools).
+- **Preservation of Legacy 421 Benchmark:**
+  - The original 421 collision rows (`eval_collisions_s2.jsonl`, where $v3$ scored 67.94% and $v3b$ scored 69.60%) are preserved as a dedicated marked benchmark (`is_legacy_421: True`) to maintain exact historical continuity.
+
 ---
 
 ## 1. Training Runs Ledger
@@ -42,10 +55,17 @@ Additional `fp32` metrics (`v2` / `v3` / `v3b`):
 
 ### S2 & S3 Ladder (4 learned actions: `tool / answer / ask / abstain`; `ESCALATE` = inference rule)
 
-| Run ID | Stage | Config | Seed | Commit | Steps | `s2_selection` | `When2Call MCQ` (`3,394`) | `AgentAbstain` (`301`) | `missing_crit_param` | `external` (`1,200`) | `collisions` (`421`) | `escalate_probe` (`107`) | Status |
-| :-- | :-- | :-- | --: | :-- | --: | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
-| `s2_baseline` | S2 | `v3b_fp32 + abstain τ + escalate rule` (no training) | `—` | pending | `0` | pending | pending | pending | pending | pending | pending | pending | Queued on Kaggle |
-| `s2_run1` | S2 | `4 actions + filtered s2_train + hard negatives` (`from v3b`) | `42` | pending | `1000` | pending | pending | pending | pending | pending | pending | pending | After baseline & filter |
+| Run ID | Stage | Config | Seed | Commit | Steps | `s2_selection` | `When2Call MCQ` (`3,394`) | `AgentAbstain` (`301`) | `missing_crit_param` | `external` (`1,200`) | `collisions` (`421`) | `escalate_probe` (`107`) | Status | Notes |
+| :-- | :-- | :-- | --: | :-- | --: | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| `s2_baseline` | S2 | `v3b_fp32 + abstain τ + escalate rule` (untrained baseline) | `—` | `37c4bf3` | `0` | `0.465` (`266/572`) | `0.350` (`1189/3394`) | `0.246` (`74/301`) | `0/101 (0%)` | `0.751` (`901/1200`) | `0.696` (`293/421`) | Rule: `97.2%` exec, `2.8%` defer | Baseline logged | 0 flips across 5 orders |
+| `s2_run1` | S2 | `4 actions + s2_train (unfiltered fallback) + hard negatives` (`from v3b`, `--teacher-kl 0.0`) | `42` | `upp-p0` | `1000` | *running* | *running* | *running* | *running* | *running* | *running* | *running* | **RUNNING on Kaggle** | `soro-s2-run-1` |
+
+**S2 Run 1 Acceptance Gates (Revised for Scientific Rigor & Tightened Post-Training Bars):**
+1. **Action Learning (Recall & Precision):** Must demonstrate non-trivial action learning: report both `ASK` recall and precision on `when2call_mcq` and `agentabstain`. The full When2Call decision score must exceed the untrained baseline of `52.33%` and benchmark against Drex's `84.8%` (MCQ `89.7%` / `85.2%`). Simple "recall > 0" is rejected as trivially easy.
+2. **Tightened No-Forgetting Tool Retention:** Tool selection accuracy on `external_s2` must be **$\ge 84.00\%$** (within 2 points of S1's `86.00%` tool-only score; the weak `75.08%` untrained baseline is rejected as too low because untrained action cards pulled probability mass away), and `collisions_s2` must remain **$\ge 69.60\%$**.
+3. **Flips Re-Verification with Action Cards:** Exactly **0 flips** across all 5 random menu permutations with the 4 action cards present in the menu (exact mathematical permutation invariance must hold with cards added).
+4. **Escalate Scored by Rule:** `escalate_probe` (107 rows) evaluated via the cost-aware risk rule (hand off when candidate set size $|S| \ge 2$ or entropy is high under high failure cost), not as an action class.
+*(Note: "Statistically significant vs untrained baseline" was dropped as a gate because the untrained baseline scores 0% on ask, making any trivial training pass).*
 
 ---
 
@@ -54,6 +74,10 @@ Additional `fp32` metrics (`v2` / `v3` / `v3b`):
 Every comparison below is computed on **strictly identical row IDs**.
 
 ### A. `eval_external` (`n=1,200`: `1,065` tool calls + `135` abstain rows)
+> **Definitive Reconciliation of External Numbers:**
+> - **`86.00%` (`1,032 / 1,200`, 95% Wilson CI `[0.839, 0.878]`):** The single canonical overall accuracy of `v3b_fp32` on `eval_external.jsonl` (1,065 tool + 135 abstain) with tool-only menu, scored under commit `37c4bf3` via `eval_upp_full.py` in `fp32`.
+> - **`84.32%` (`898 / 1,065`):** Tool-only accuracy within the 1,065 tool-request rows of `external_s2` when measured in isolation.
+> - **`75.08%` (`901 / 1,200`):** Untrained S2 baseline score when 4 new action cards (`CALL`, `ANSWER`, `ASK`, `ABSTAIN`) were injected into the menu without any S2 training, pulling distractor probability mass away from tools.
 
 | System | Params / Kind | Overall (`n=1,200`) | 95% Wilson CI | Tool (`n=1,065`) | Abstain (`n=135`) | Conformal (`α=0.10`) Size @ Cov | Median Latency (ms) | Flips (5-ord) |
 | :-- | :-- | --: | :-- | --: | --: | --: | --: | --: |
@@ -68,6 +92,7 @@ Every comparison below is computed on **strictly identical row IDs**.
 | `soro_4b` (ceiling) | Soro-Kev `4B` SFT | `0.9058` (`1087/1200`) | `[0.888, 0.921]` | `0.9052` (`964/1065`) | `0.9111` (`123/135`) | `1.01 @ 91.0%` | — | — |
 
 ### B. `BFCL v3` (`n=100`: `34` Multiple + `33` Live Multiple + `33` Irrelevance)
+> **Note on Baseline Scope:** BFCL is a 100-row slice comparing models of unequal parameter footprints (4B vs 1.0–1.5B). Differences under ~9 pts are within sampling noise. A conclusive comparison requires running Hammer and xLAM across the full 1,200 external split.
 
 | System | Overall (`n=100`) | 95% Wilson CI | Multiple (`34`) | Live (`33`) | Irrel (`33`) | Median Latency (ms) |
 | :-- | --: | :-- | --: | --: | --: | --: |
@@ -155,7 +180,10 @@ Evaluated locked `v3b_fp32` (`Qwen/Qwen3-0.6B-Base`, no S2 training) on all 7 S2
 
 ### B. G2 Finite-Sample Conformal Sets & Drex Option-Count Calibration
 
-- **Finite-Sample Coverage Guarantee:** In-split 50/50 split conformal yields empirical coverage of **`0.948 – 0.961`** at `alpha=0.05` (nominal `0.95`) and **`0.899 – 0.913`** at `alpha=0.10` (nominal `0.90`) across all held-out splits.
+- **Finite-Sample Coverage & Set Size (Diagnosis of Over-Coverage):**
+  - Within-split 50/50 calibration on `s2_selection`: empirical coverage is **`90.2%`** (nominal `0.90`) at mean set size **`|S| = 4.74`** on a mean menu size $K=5.72$ options (**`|S|/K = 82.9%`** of the menu).
+  - Cross-split transfer to `external_s2` and `collisions_s2`: empirical coverage over-covers to **`94.8% – 96.1%`** at $\alpha=0.05$ and up to **`100%`** under severe shift, accompanied by bloated set sizes (**`|S| = 7.42`** on external menus of mean length $K=7.91$, or **`|S|/K = 93.8%`**).
+  - *Root cause:* The untrained baseline has nearly flat entropy across the 4 unseen action cards (`CALL`, `ANSWER`, `ASK`, `ABSTAIN`). Because the model was not trained on action cards, its uncalibrated softmax distribution is diffused across all options. Conformal prediction must include almost the entire menu to achieve 90% coverage on diffused distributions. Once trained on S2, sharpened posterior distributions will compress $|S|$ towards $\sim 1.1–1.3$ options ($|S|/K \sim 15–20\%$). Reporting $|S|/K$ is required so set sizes are interpreted relative to menu complexity.
 - **Drex Gap on `K in [6, 20]` Multi-Option Menus:**
   - On `collisions_s2` (`K=7..10`, `n=421`): ECE-15 = **`0.1175`**, Flips = **`0/421`**.
   - On `external_s2` (`K=6..9`, `n=1200`): ECE-15 = **`0.1911`**, Flips = **`0/1200`**.
@@ -174,4 +202,4 @@ Evaluated locked `v3b_fp32` (`Qwen/Qwen3-0.6B-Base`, no S2 training) on all 7 S2
    - **Frozen 8B Teacher:** **`208/270` (`77.04%`)** [`0.717, 0.817`].
    - **Delta:** **`-21.48 pts`** (Teacher is 21.5 pts worse than our model on tool selection!).
    - **Paired McNemar:** `60` rows correct in `v3b` only vs `2` correct in teacher only, **`p = 8.47e-16`**.
-   - **Gate Decision:** **GATE FAILED**. Soft distillation (`--teacher-kl > 0`) is strictly **LOCKED OUT**. The teacher is used **ONLY as an agreement filter** (`filter_mode=exact`, dropping rows where teacher disagrees with rule labels).
+   - **Gate Decision:** **EXTERNAL 8B TEACHER SOFT DISTILLATION LOCKED OUT**. Soft distillation from the external 4-bit `Qwen/Qwen3-8B` teacher is strictly blocked due to its 77.04% tool degradation (-21.5 pts vs our model). However, distillation itself is NOT abandoned: under Track A2 / Plan V7, our own trained 4B model (`soro-4b`) will serve as the distillation teacher for student models (0.6B / 2B) once it passes its 90.6% gate.

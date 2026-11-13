@@ -423,6 +423,24 @@ def _aligned_order_loss(
     return torch.stack(terms).mean()
 
 
+def _save_upp_ckpt(model: Any, ckpt_dir: Path) -> None:
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    head_state = {
+        "head": model.head.state_dict(),
+        "cfg": model.config_dict(),
+    }
+    if model.pool is not None:
+        head_state["pool"] = model.pool.state_dict()
+    if model.slots is not None:
+        head_state["slots"] = model.slots.detach().cpu()
+    if model.gist_emb is not None:
+        head_state["gist_emb"] = model.gist_emb.detach().cpu()
+    torch.save(head_state, ckpt_dir / "head.pt")
+    if not model.is_mock and hasattr(model.backbone, "save_pretrained"):
+        model.backbone.save_pretrained(ckpt_dir / "adapter")
+    print(f"  saved checkpoint to {ckpt_dir}", flush=True)
+
+
 def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: list[dict[str, Any]],
               evals: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     torch.manual_seed(args.seed)
@@ -540,6 +558,8 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
                   f"{(step + 1) * args.batch / (time.time() - t0):.1f} rows/s", flush=True)
             run_loss = run_acc = 0.0
             run_n = 0
+        if getattr(args, "save_ckpt", False) and getattr(args, "save_every", 0) and (step + 1) % args.save_every == 0:
+            _save_upp_ckpt(model, Path(args.out) / f"ckpt_{key}_step_{step + 1}")
     train_secs = time.time() - t0
     peak = torch.cuda.max_memory_allocated() / 2 ** 20 if device == "cuda" else 0.0
     result = {"config": cfg.name(), "trainable_params": n_train, "train_secs": train_secs,
@@ -551,21 +571,7 @@ def train_one(key: str, cfg: UPPConfig, args: argparse.Namespace, train_rows: li
         result["eval"][name] = evaluate(model, f"{key}/{name}", rows)
     if getattr(args, "save_ckpt", False):
         ckpt_dir = Path(args.out) / f"ckpt_{key}"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        head_state = {
-            "head": model.head.state_dict(),
-            "cfg": model.config_dict(),
-        }
-        if model.pool is not None:
-            head_state["pool"] = model.pool.state_dict()
-        if model.slots is not None:
-            head_state["slots"] = model.slots.detach().cpu()
-        if model.gist_emb is not None:
-            head_state["gist_emb"] = model.gist_emb.detach().cpu()
-        torch.save(head_state, ckpt_dir / "head.pt")
-        if not model.is_mock and hasattr(model.backbone, "save_pretrained"):
-            model.backbone.save_pretrained(ckpt_dir / "adapter")
-        print(f"  saved checkpoint to {ckpt_dir}", flush=True)
+        _save_upp_ckpt(model, ckpt_dir)
     del model, opt
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -716,6 +722,7 @@ def main() -> None:
     ap.add_argument("--init-ckpt", default="",
                     help="Optional saved UPP checkpoint dir (head.pt + adapter/) to initialize S2 training from locked S1.")
     ap.add_argument("--save-ckpt", action="store_true", help="Save trained LoRA adapter and UPP head to --out/ckpt_<key>.")
+    ap.add_argument("--save-every", type=int, default=250, help="Save intermediate checkpoint every N steps for resume.")
     ap.add_argument("--k-min", type=int, default=4)
     ap.add_argument("--k-max", type=int, default=64)
     ap.add_argument("--smoke", action="store_true", help="Tiny CPU run with a mock backbone")

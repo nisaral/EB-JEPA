@@ -313,6 +313,7 @@ def main() -> None:
     ap.add_argument("--shard", default="0/1", help="Shard index/total, e.g. 0/2 or 1/2")
     ap.add_argument("--merge-shards", default="", help="Comma-separated scored_rows_*.json files to merge")
     ap.add_argument("--smoke", action="store_true", help="Mock/CPU tiny sanity mode")
+    ap.add_argument("--load-in-4bit", action="store_true", help="Load backbone in 4-bit NF4 (essential for 4B models on 15GB T4)")
     ap.add_argument("--amp", action="store_true", help="Allow bf16 autocast on GPUs with native bf16 (off by default to match fp32 scoring)")
     ap.add_argument("--max-rows", type=int, default=0, help="Optional cap per split (0 = all rows)")
     ap.add_argument("--out", default=str(REPO / "veyra" / "runs" / "full_eval"))
@@ -345,11 +346,19 @@ def main() -> None:
     shard_idx_s, shard_tot_s = args.shard.split("/")
     shard_idx, shard_total = int(shard_idx_s), int(shard_tot_s)
     device = "cuda" if torch.cuda.is_available() and not args.smoke else "cpu"
-    dtype = None if (device == "cpu" or (args.amp and torch.cuda.is_bf16_supported())) else torch.float32
-    model = UPPModel.from_checkpoint(args.ckpt, use_mock=args.smoke, torch_dtype=dtype)
-    if dtype is torch.float32 and not model.is_mock:
+    four_bit = bool(getattr(args, "load_in_4bit", False))
+    dtype = None if (four_bit or device == "cpu" or (args.amp and torch.cuda.is_bf16_supported())) else torch.float32
+    model = UPPModel.from_checkpoint(args.ckpt, use_mock=args.smoke, load_in_4bit=four_bit, torch_dtype=dtype)
+    if dtype is torch.float32 and not model.is_mock and not four_bit:
         model.backbone.float()
-    model.to(device)
+    if four_bit and device == "cuda":
+        model.head.to(device)
+        if model.slots is not None:
+            model.slots.data = model.slots.data.to(device)
+        if model.gist_emb is not None:
+            model.gist_emb.data = model.gist_emb.data.to(device)
+    else:
+        model.to(device)
     model.eval()
 
     eval_pairs = _parse_splits(args.eval_files)
