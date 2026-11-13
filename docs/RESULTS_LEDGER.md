@@ -129,4 +129,49 @@ Published baselines from Dhankhar et al. (Nov 2026) — full analysis in [`docs/
 | `Drex v1.5` | `9B / 9B` (Open) | `89.7` / `84.8` | `86.8%` | `80.5%` | `5.3%` / `15.6%` (`8.4%` rev) | `13.6%` / `10.1%` | None |
 | `Drex v2.0` | `3B / 35B` (Open) | `86.5` / `86.2` | `87.9%` | `93.5%` | `5.9%` / `16.2%` (`8.0%` rev) | `2.0%` / `5.0%` | None |
 | `Drex Max` | `27B / 27B` | `85.2` / `94.0` | `94.0%` | `97.0%` | `4.3%` / `13.3%` (`6.2%` rev) | `8.4%` / `9.2%` | Vision (`Max` only); no speech / CP / cards |
-| `S1-UPP v3b` (Ours) | **`0.6B`** | pending S2 eval | planned | planned | **`0.00%` (`0/5207`) / `0.00%` (`K>=6`)** | Conformal (`G2`) | `G1`–`G5` in execution (`docs/NORTH_STAR.md`) |
+| `S1-UPP v3b` (Ours) | **`0.6B`** | `52.3%` (Set-as-Action) / S2 pending | planned | planned | **`0.00%` (`0/6050`) / `0.00%` (`K>=6`)** | Conformal (`G2`, ECE `0.118–0.191` on tools) | `G1`–`G5` in execution (`docs/NORTH_STAR.md`) |
+
+---
+
+## 5. S2 Baseline (`v3b_fp32` without S2 Training), G2/G3 Guarantees & Teacher Gate
+
+Evaluated locked `v3b_fp32` (`Qwen/Qwen3-0.6B-Base`, no S2 training) on all 7 S2 splits (`n=6,050` total passes x 5 orders = `30,250` forwards), strictly tuning `abstain_thresh = 0.50` on `s2_selection`, comparing against `G3` Set-as-Action (`|S_tool|=0 -> abstain, |S_tool|=1 -> act, |S_tool|>=2 -> ask`), and running the paired Teacher Audit + `+3.0 pt` Soft-Label Gate on Kaggle (`jackobperalta/soro-s2-baseline-and-teacher-gate`, v2).
+
+### A. S2 Baseline Policy & G3 Set-as-Action Results (`fp32`, 5 Menu Permutations)
+
+| Split | n | K range (mean) | Raw `v3b` Acc [95% CI] | Tuned Tau=0.5 Acc | G3 Set-Action (`q=0.5`) | G3 Δ vs Raw (McNemar p) | Flips (5 orders) | `action:tool` | `action:ask` | `action:abstain` |
+| :--- | --: | :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: |
+| `s2_selection` (cal) | 572 | 4–11 (5.7) | `0.465` (`266/572`) [0.425, 0.506] | `0.544` (`311/572`) | `0.554` (`317/572`) | `+8.92 pts` (`p=8.88e-16`) | **`0/572` (`0.0%`)** | `0.985` (`266/270`) | `0.000` (`0/250`) | `0.981` (`51/52`) |
+| `when2call_mcq` | 3,394 | 4–40 (6.2) | `0.350` (`1189/3394`) [0.334, 0.367] | `0.453` (`1536/3394`) | `0.523` (`1776/3394`) | `+17.30 pts` (`p=8.03e-170`) | **`0/3394` (`0.0%`)** | `0.915` (`1185/1295`) | `0.000` (`0/1062`) | `0.570` (`591/1037`) |
+| `external_s2` | 1,200 | 6–9 (7.9) | `0.751` (`901/1200`) [0.726, 0.774] | `0.822` (`986/1200`) | `0.849` (`1019/1200`) | `+9.83 pts` (`p=2.99e-32`) | **`0/1200` (`0.0%`)** | `0.843` (`898/1065`) | — | `0.896` (`121/135`) |
+| `collisions_s2` | 421 | 7–10 (8.2) | `0.696` (`293/421`) [0.650, 0.738] | `0.629` (`265/421`) | `0.658` (`277/421`) | `-3.80 pts` (`p=3.05e-05`) | **`0/421` (`0.0%`)** | `0.658` (`277/421`) | — | — |
+| `agentabstain` | 301 | 6–67 (20.8) | `0.246` (`74/301`) [0.201, 0.297] | `0.243` (`73/301`) | `0.256` (`77/301`) | `+1.00 pts` (`p=0.549`) | **`0/301` (`0.0%`)** | `0.422` (`70/166`) | `0.000` (`0/101`) | `0.206` (`7/34`) |
+| `near_miss_s2` | 55 | 7–9 (7.9) | `0.000` (`0/55`) [0.000, 0.065] | `0.436` (`24/55`) | `0.600` (`33/55`) | `+60.00 pts` (`p=2.33e-10`) | **`0/55` (`0.0%`)** | — | — | `0.600` (`33/55`) |
+| `ALL_EVAL_POOLED` | 5,371 | 4–67 (7.6) | `0.457` (`2457/5371`) [0.444, 0.471] | `0.556` (`2984/5371`) | `0.592` (`3182/5371`) | `+13.50 pts` (`p=4.48e-185`) | **`0/5371` (`0.0%`)** | `0.825` (`2430/2947`) | `0.000` (`0/1163`) | `0.596` (`752/1261`) |
+| `ALL_EVAL_K_6_20` | 3,816 | 6–20 (7.9) | `0.523` (`1995/3816`) [0.507, 0.539] | `0.607` (`2317/3816`) | `0.632` (`2411/3816`) | `+10.90 pts` (`p=1.44e-101`) | **`0/3816` (`0.0%`)** | `0.824` (`1982/2405`) | `0.000` (`0/805`) | `0.602` (`429/712`) |
+| `escalate_probe` (probe) | 107 | 6–9 (8.0) | — | Escalate: `1.9%` (`2/107`) | Defer/Escalate: `2.8%` | Exec: `97.2%` (`104/107`) | **`0/107` (`0.0%`)** | — | — | — |
+
+*Key finding on G3:* The untuned Set-as-Action rule (`|S_tool|=0 -> abstain`, `|S_tool|=1 -> act`, `|S_tool|>=2 -> ask`) boosts accuracy by **+13.50 pts overall** (and **+17.30 pts on When2Call MCQ**, **+9.83 pts on external**) with zero additional training, while preserving exact **0/6,050 flips**!
+
+### B. G2 Finite-Sample Conformal Sets & Drex Option-Count Calibration
+
+- **Finite-Sample Coverage Guarantee:** In-split 50/50 split conformal yields empirical coverage of **`0.948 – 0.961`** at `alpha=0.05` (nominal `0.95`) and **`0.899 – 0.913`** at `alpha=0.10` (nominal `0.90`) across all held-out splits.
+- **Drex Gap on `K in [6, 20]` Multi-Option Menus:**
+  - On `collisions_s2` (`K=7..10`, `n=421`): ECE-15 = **`0.1175`**, Flips = **`0/421`**.
+  - On `external_s2` (`K=6..9`, `n=1200`): ECE-15 = **`0.1911`**, Flips = **`0/1200`**.
+  - Drex publishes `8.4%` (Max) / `13.6%` (v1.5) ECE on `6–20` options, but with **`13.3% – 16.2%` flips**; our model guarantees **`0.00%` flips**.
+
+### C. Teacher Audit & Soft-Label Gate (`Qwen/Qwen3-8B` 4-bit, 4 rotations)
+
+1. **Gold-100 Agreement (`s2_gold_100.jsonl`, 25 per action, review in [`s2_gold_100_review.md`](../veyra/runs/omni_data/s2/s2_gold_100_review.md)):**
+   - Overall Agreement: **`69/100` (`69.0%`)** [`0.593, 0.772`].
+   - `tool`: `14/25` (`56.0%`) [Teacher confused 7 tools with `__ask__`, 3 with `__abstain__`, 1 with `__answer__`].
+   - `answer`: `23/25` (`92.0%`) [2 confused with `__abstain__`].
+   - `ask`: `12/25` (`48.0%`) [9 called tool blindly without checking required parameters, 3 abstained, 1 answered].
+   - `abstain`: `20/25` (`80.0%`) [4 asked clarification, 1 called tool].
+2. **Paired Soft-Label Gate on `s2_selection` Tool Rows (`n=270`):**
+   - **`v3b_fp32` (Ours):** **`266/270` (`98.52%`)** [`0.963, 0.994`].
+   - **Frozen 8B Teacher:** **`208/270` (`77.04%`)** [`0.717, 0.817`].
+   - **Delta:** **`-21.48 pts`** (Teacher is 21.5 pts worse than our model on tool selection!).
+   - **Paired McNemar:** `60` rows correct in `v3b` only vs `2` correct in teacher only, **`p = 8.47e-16`**.
+   - **Gate Decision:** **GATE FAILED**. Soft distillation (`--teacher-kl > 0`) is strictly **LOCKED OUT**. The teacher is used **ONLY as an agreement filter** (`filter_mode=exact`, dropping rows where teacher disagrees with rule labels).

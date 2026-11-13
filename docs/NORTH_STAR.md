@@ -32,10 +32,11 @@ Drex (`arXiv:2611.07854`, 9B–35B, 1.15M records) + Kev/Jev own **"plain decisi
 ## 2. Immediate Execution Queue (Strictly Ordered — Update Every Run)
 
 - [x] **S1 Lock & Owed Integrity Checks:** `v3b_fp32` locked (`0/5,207` flips, `0.8600` external, `84/100` BFCL v3); baseline table, gold-position check, and 84 `near_miss` buckets completed & pushed (`6b2b57f`).
-- [ ] **S2 Baseline + Gold-100 Judge + `+3pt` Soft-Label Gate:** Running on Kaggle (`jackobperalta/soro-s2-baseline-and-teacher-gate` v2).
-- [ ] **Owner Hand-Check (`s2_gold_100_review.md`):** Deliver judge vs rule accuracy + clickable review sheet for owner verification.
+- [x] **S2 Baseline + Gold-100 Judge + `+3pt` Soft-Label Gate:** Complete (`0/6,050` flips across 5 orders; G2 coverage 0.948–0.961; G3 Set-as-Action +13.5 pts; gate failed with teacher 77.0% vs v3b 98.5%, soft labels locked OUT).
+- [x] **Owner Hand-Check ([`s2_gold_100_review.md`](file:///c:/Users/nisar/OneDrive/Desktop/EB-JEPA/veyra/runs/omni_data/s2/s2_gold_100_review.md)):** Delivered with 31 disagreement rows, rule vs teacher breakdown, and soft-label gate analysis.
 - [ ] **S2 Train Filtering:** Run `soro-s2-filter-train` (`Qwen3-8B` 4-bit filter on `8,953` `s2_train` rows, zero leakage check).
 - [ ] **S2 Run 1 (4 actions, expected cost, from `v3b`) + `G2`/`G3` Eval:** Train on Kaggle + `fp32` 5-order eval + **test `set-as-action` (`|S|=0/1/>=2`) vs 4-class head** + **Drex v1.5 4-bit baseline** on `eval_external_s2`, `When2Call MCQ`, `AgentAbstain`, `6–20` opt calibration & flips (`docs/RESULTS_LEDGER.md`).
 - [ ] **G1 Scaling & Depth Ablations (before preprint):** 3 seeds (`42, 43, 44`), `refiner-layers 1 vs 2`, `K in [6, 20]` slice, and `Decision Bench v4` + `DecideBench v1.1`.
 - [ ] **G4 Speech & Streaming Early-Commit:** Collect TTS shards `s0..s7` + download `SLURP` real-speech eval -> Whisper cascade baseline -> S3 multimodal + prefix early-commit conformal bound vs `RASSG`.
 - [ ] **G5 Outcome Cards Stream Eval:** Build synthetic+real non-stationary tool stream and measure no-retrain accuracy recovery.
+
