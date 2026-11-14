@@ -231,6 +231,7 @@ def main() -> None:
     ap.add_argument("--ckpt", default=None, help="S1 locked v3b checkpoint dir (head.pt + adapter/)")
     ap.add_argument("--judge-model", default="Qwen/Qwen3-8B")
     ap.add_argument("--four-bit", action="store_true")
+    ap.add_argument("--load-in-4bit", action="store_true", help="Load evaluated UPP model in 4-bit NF4 with float32 compute")
     ap.add_argument("--rotations", type=int, default=4)
     ap.add_argument("--batch-size", type=int, default=8, help="UPP eval batch size")
     ap.add_argument("--judge-batch-rows", type=int, default=4)
@@ -257,11 +258,11 @@ def main() -> None:
         device = "cuda" if torch.cuda.is_available() and not args.smoke else "cpu"
         dtype = None if device == "cpu" else torch.float32
         if args.ckpt:
-            model = UPPModel.from_checkpoint(args.ckpt, use_mock=args.smoke, torch_dtype=dtype)
+            model = UPPModel.from_checkpoint(args.ckpt, use_mock=args.smoke, torch_dtype=dtype, load_in_4bit=args.load_in_4bit)
         else:
             from soro.routing.upp import UPPConfig
             model = UPPModel(UPPConfig(layout="query_first", head="dot", refiner=True, option_index=False, option_isolation=True), use_mock=True)
-        if dtype is torch.float32 and not model.is_mock:
+        if dtype is torch.float32 and not model.is_mock and not getattr(args, "load_in_4bit", False):
             model.backbone.float()
         model.to(device)
         model.eval()
