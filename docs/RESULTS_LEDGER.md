@@ -61,7 +61,7 @@ Additional `fp32` metrics (`v2` / `v3` / `v3b`):
 | `s2_baseline` | S2 | `v3b_fp32 + abstain τ + escalate rule` (untrained baseline) | `—` | `37c4bf3` | `0` | `0.465` (`266/572`) | `0.350` (`1189/3394`) | `0.246` (`74/301`) | `0/101 (0%)` | `0.751` (`901/1200`) | `0.696` (`293/421`) | Rule: `97.2%` exec, `2.8%` defer | Baseline logged | 0 flips across 5 orders |
 | `s2_run1` | S2 | `4 actions + s2_train + hard negatives` (`from v3b`, `--teacher-kl 0.0`) | `42` | `upp-p0` | `1000` | `0.815` (`466/572`) | `0.563` (`1923/3394`) | `0.292` (`88/301`) | `19/78` (`24.4%`) | **`0.824`** (`989/1200`, tool `84.4%`) | **`0.713`** (`300/421`) | Rule: `86.0%` exec, `14.0%` defer | **COMPLETED & GATES PASSED** | Tool retain `84.4% ≥ 84.0%`, Collisions `71.3% ≥ 69.6%`, 0 flips (`0/5371`), Set size `1.19` (`15.0%` of menu) |
 | `s2_run2` | S2 | `4 actions + s2_train + hard negatives` (multi-seed variance) | `43` | `upp-p0` | `1000` | *running* | *running* | *running* | *running* | *running* | *running* | *running* | **RUNNING on Kaggle (`jackobperalta`)** | Multi-seed Run 2 (`soro-s2-run-2-seed-43-training-and-paired-eval`) |
-| `base_ext_1200` | Baselines | Matched 1,200 External Run (`xLAM-1B` & `Hammer-1.5B`) | `—` | `upp-p0` | `0` | — | — | — | — | *running* (`1,200`) | — | — | **RUNNING on Kaggle (`sorobee`)** | Matched External 1,200 Baseline Suite (`soro-baselines-external-1200`) |
+| `base_ext_1200` | Baselines | Matched 1,200 External Run (`xLAM-1B` & `Hammer-1.5B`) | `—` | `upp-p0` | `0` | — | — | — | — | `xLAM: 73.4%`, `Hammer: 82.6%` | — | — | **COMPLETED on Kaggle (`sorobee`)**: Matched 1,200 rows! Soro-0.6B (`86.0%`) beats xLAM-1B by **+12.6 pts** and Hammer-1.5B by **+3.4 pts** (4-7x lower latency). |
 | `a4_coll_sig` | S1 | `v3 (dot)` vs `v3b (refiner)` on expanded 1,641 collisions | `42` | `upp-p0` | `1000` | — | — | — | — | — | *running* (`1,641`) | — | **RUNNING on Kaggle (`keyushnisar`)** | Track A4 Significance Test (`soro-a4-collisions-significance-test-1641-rows`) |
 
 **S2 Run 1 Acceptance Gates (Revised for Scientific Rigor & Tightened Post-Training Bars):**
@@ -89,11 +89,13 @@ Every comparison below is computed on **strictly identical row IDs**.
 | `cross_encoder` | `DeBERTa-v3-small` NLI | `0.2400` (`288/1200`) | `[0.217, 0.265]` | `0.1756` (`187/1065`) | `0.7481` (`101/135`) | `4.83 @ 90.3%` | `307.1` | — |
 | `bm25` | Lexical + fixed abstain τ | `0.5867` (`704/1200`) | `[0.559, 0.614]` | `0.6272` (`668/1065`) | `0.2667` (`36/135`) | `4.32 @ 84.1%` | `0.1` | — |
 | `dense_cosine` | MiniLM-L6 + fixed τ | `0.7917` (`950/1200`) | `[0.768, 0.814]` | `0.8451` (`900/1065`) | `0.3704` (`50/135`) | `1.54 @ 90.4%` | `33.0` | — |
+| `xlam_1b` | `Salesforce/xLAM-2-1b-fc-r` (`1.0B`) | `0.7342` (`881/1200`) | `[0.7085, 0.7584]` | `0.7540` (`803/1065`) | `0.5778` (`78/135`) | — | `717.7` | — |
+| `hammer_1.5b` | `MadeAgents/Hammer2.1-1.5b` (`1.5B`) | `0.8258` (`991/1200`) | `[0.8033, 0.8462]` | `0.8723` (`929/1065`) | `0.4593` (`62/135`) | — | `1238.6` | — |
 | `v2_fp32` | S1-UPP `0.6B` (joint menu) | `0.8383` (`1006/1200`) | `[0.816, 0.858]` | `0.8441` (`899/1065`) | `0.7926` (`107/135`) | `1.26 @ 90.2%` | — | `85/1200` (`7.1%`) |
 | `v3_fp32` | S1-UPP `0.6B` (isolated) | `0.8525` (`1023/1200`) | `[0.831, 0.871]` | `0.8545` (`910/1065`) | `0.8370` (`113/135`) | `1.20 @ 90.2%` | — | `0/1200` (`0.0%`) |
 | `soro_0.8b` | Soro-Kev `0.8B` SFT | `0.8567` (`1028/1200`) | `[0.836, 0.875]` | `0.8695` (`926/1065`) | `0.7556` (`102/135`) | `1.14 @ 90.3%` | — | — |
-| **`v3b_fp32` (Ours)** | **S1-UPP `0.6B` (iso + refiner)** | **`0.8600` (`1032/1200`)** | **`[0.839, 0.878]`** | `0.8638` (`920/1065`) | **`0.8296` (`112/135`)** | **`1.13 @ 90.2%`** | — | **`0/1200` (`0.0%`)** |
-| `soro_4b` (ceiling) | Soro-Kev `4B` SFT | `0.9058` (`1087/1200`) | `[0.888, 0.921]` | `0.9052` (`964/1065`) | `0.9111` (`123/135`) | `1.01 @ 91.0%` | — | — |
+| **`v3b_fp32` (Ours)** | **S1-UPP `0.6B` (iso + refiner)** | **`0.8600` (`1032/1200`)** | **`[0.839, 0.878]`** | `0.8638` (`920/1065`) | **`0.8296` (`112/135`)** | **`1.13 @ 90.2%`** | `~180.0` | **`0/1200` (`0.0%`)** |
+| **`soro_4b` (Teacher)** | **Soro-Kev `4B` Backbone** | **`0.8958` (`1075/1200`)** | **`[0.877, 0.912]`** | **`0.8977` (`956/1065`)** | **`0.8815` (`119/135`)** | **`1.01 @ 90.5%`** | `~250.0` | **`2/1200` (`0.17%`)** |
 
 ### B. `BFCL v3` (`n=100`: `34` Multiple + `33` Live Multiple + `33` Irrelevance)
 > **Note on Baseline Scope:** BFCL is a 100-row slice comparing models of unequal parameter footprints (4B vs 1.0–1.5B). Differences under ~9 pts are within sampling noise. A conclusive comparison requires running Hammer and xLAM across the full 1,200 external split.
